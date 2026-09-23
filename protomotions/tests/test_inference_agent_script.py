@@ -156,6 +156,54 @@ def test_inference_parser_requires_checkpoint_and_parses_options(monkeypatch, tm
     assert parsed.overrides == ["env.max_episode_length=5"]
 
 
+@pytest.mark.parametrize("value", ["0", "-1", "abc"])
+def test_inference_parser_rejects_invalid_num_envs(
+    monkeypatch, tmp_path, capsys, value
+):
+    module = _load_inference_agent_globals(monkeypatch, tmp_path / "last.ckpt")
+
+    with pytest.raises(SystemExit) as exc:
+        module["create_parser"]().parse_args(
+            [
+                "--checkpoint",
+                "last.ckpt",
+                "--simulator",
+                "newton",
+                "--num-envs",
+                value,
+            ]
+        )
+
+    assert exc.value.code == 2
+    assert "must be a positive integer" in capsys.readouterr().err
+
+
+def test_inference_main_reports_missing_checkpoint(monkeypatch, tmp_path, capsys):
+    checkpoint = tmp_path / "last.ckpt"
+    module = _load_inference_agent_globals(monkeypatch, checkpoint)
+
+    with pytest.raises(SystemExit) as exc:
+        module["main"]()
+
+    assert exc.value.code == 2
+    assert f"checkpoint file not found: {checkpoint}" in capsys.readouterr().err
+
+
+def test_inference_main_reports_missing_config(monkeypatch, tmp_path, capsys):
+    checkpoint = tmp_path / "last.ckpt"
+    checkpoint.write_text("checkpoint")
+    module = _load_inference_agent_globals(monkeypatch, checkpoint)
+
+    with pytest.raises(SystemExit) as exc:
+        module["main"]()
+
+    assert exc.value.code == 2
+    assert (
+        f"inference config not found: {tmp_path / 'resolved_configs_inference.pt'}"
+        in capsys.readouterr().err
+    )
+
+
 def test_inference_command_source_override_sets_target_keyboard_source(
     monkeypatch,
     tmp_path,
