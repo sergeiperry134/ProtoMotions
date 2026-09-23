@@ -1,7 +1,7 @@
 {
   "version": 1,
   "scripts": {
-    "run": "python3 apps/teleflow/server.py --host 0.0.0.0 --port 3000 --demo --db apps/teleflow/.preview.sqlite3"
+    "run": "python3 apps/teleflow/server.py --host 0.0.0.0 --port 3000 --demo"
   },
   "ports": {
     "preview": 3000
