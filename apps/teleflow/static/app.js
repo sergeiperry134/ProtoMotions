@@ -271,7 +271,7 @@ function empty(ico, title, description, action = '', compact = false) {
 function campaignActions(item) {
   const title = safe(item.title);
   if (['draft', 'scheduled'].includes(item.status)) {
-    return `<button type="button" data-action="edit-campaign" data-id="${item.id}" aria-label="Редактировать ${title}" title="Редактировать">${icon('edit', 14)}</button><button type="button" data-action="schedule-campaign" data-id="${item.id}" aria-label="Запланировать ${title}" title="Запланировать">${icon('calendar', 14)}</button><button type="button" data-action="send-campaign" data-id="${item.id}" aria-label="Отправить ${title}" title="Отправить" ${canSend() ? '' : 'disabled'}>${icon('send', 14)}</button><button type="button" data-action="delete-campaign" data-id="${item.id}" aria-label="Удалить ${title}" title="Удалить">${icon('trash', 14)}</button>`;
+    return `<button type="button" data-action="edit-campaign" data-id="${item.id}" aria-label="Редактировать ${title}" title="Редактировать">${icon('edit', 14)}</button><button type="button" data-action="schedule-campaign" data-id="${item.id}" aria-label="Запланировать ${title}" title="Запланировать">${icon('calendar', 14)}</button>${item.status === 'scheduled' ? `<button type="button" data-action="cancel-schedule" data-id="${item.id}" aria-label="Отменить расписание: ${title}" title="Отменить расписание">${icon('close', 14)}</button>` : ''}<button type="button" data-action="send-campaign" data-id="${item.id}" aria-label="Отправить ${title}" title="Отправить" ${canSend() ? '' : 'disabled'}>${icon('send', 14)}</button><button type="button" data-action="delete-campaign" data-id="${item.id}" aria-label="Удалить ${title}" title="Удалить">${icon('trash', 14)}</button>`;
   }
   if (['partial', 'failed'].includes(item.status) && item.failed_count) {
     return `<button type="button" data-action="retry-campaign" data-id="${item.id}" aria-label="Повторить неудачные отправки: ${title}" title="Повторить неудачные отправки" ${canSend() ? '' : 'disabled'}>${icon('refresh', 14)}</button>`;
@@ -319,7 +319,7 @@ function audiencePage() {
   return `${heading('Аудитория', 'Люди, которые сами запустили вашего Telegram-бота.', `<button type="button" class="btn btn-secondary" data-action="sync" ${canSend() ? '' : 'disabled'}>${icon('refresh', 14)} Синхронизировать</button>`)}${banner()}
     <div class="page-grid"><div><div class="stats-grid" style="grid-template-columns:repeat(2,minmax(0,1fr))">${stat('Активные подписчики', active, 'Могут получать сообщения', 'users')}${stat('Отписались', state.subscribers.length - active, 'Больше не получают рассылки', 'shield', 'orange')}</div>
     <div class="toolbar"><div class="tabs" role="group" aria-label="Фильтр подписчиков">${[['all','Все'],['active','Подписаны'],['off','Отписались']].map(([id,label]) => `<button class="tab${state.filters.people === id ? ' active' : ''}" type="button" data-action="filter-people" data-filter="${id}">${label}</button>`).join('')}</div><label class="search-field">${icon('search', 15)}<input type="search" data-search="audienceSearch" value="${safe(state.filters.audienceSearch)}" placeholder="Имя или @username" aria-label="Найти подписчика" /></label></div>
-    <section class="panel">${filtered.length ? `<div class="table-wrap"><table><thead><tr><th>Подписчик</th><th>Telegram ID</th><th>Дата подписки</th><th>Статус</th></tr></thead><tbody>${filtered.map(item => `<tr><td><div class="item-name"><span class="avatar">${safe(initials(displayName(item)))}</span><span><strong>${safe(displayName(item))}</strong><span class="subtext">${item.username ? `@${safe(item.username)}` : 'Без username'}</span></span></div></td><td>${safe(item.chat_id)}</td><td>${formatDate(item.joined_at)}</td><td><span class="dot${item.opted_in ? '' : ' off'}"></span>${item.opted_in ? 'Подписан' : 'Отписался'}</td></tr>`).join('')}</tbody></table></div>` : state.subscribers.length ? empty('search','Ничего не найдено','Измените поисковый запрос или фильтр.') : empty('users','Здесь появятся подписчики','Поделитесь ссылкой на бота. Пользователи появятся здесь после команды /start.')}</section></div>
+    <section class="panel">${filtered.length ? `<div class="table-wrap"><table><thead><tr><th>Подписчик</th><th>Telegram ID</th><th>Дата подписки</th><th>Статус</th><th aria-label="Действия"></th></tr></thead><tbody>${filtered.map(item => `<tr><td><div class="item-name"><span class="avatar">${safe(initials(displayName(item)))}</span><span><strong>${safe(displayName(item))}</strong><span class="subtext">${item.username ? `@${safe(item.username)}` : 'Без username'}</span></span></div></td><td>${safe(item.chat_id)}</td><td>${formatDate(item.joined_at)}</td><td><span class="dot${item.opted_in ? '' : ' off'}"></span>${item.opted_in ? 'Подписан' : 'Отписался'}</td><td><div class="table-actions">${item.opted_in ? `<button type="button" data-action="opt-out" data-id="${safe(item.chat_id)}" aria-label="Отписать ${safe(displayName(item))}" title="Отписать (opt-out)" ${state.pending ? 'disabled' : ''}>${icon('close', 14)}</button>` : ''}</div></td></tr>`).join('')}</tbody></table></div>` : state.subscribers.length ? empty('search','Ничего не найдено','Измените поисковый запрос или фильтр.') : empty('users','Здесь появятся подписчики','Поделитесь ссылкой на бота. Пользователи появятся здесь после команды /start.')}</section></div>
     <div class="dashboard-stack"><section class="panel panel-pad"><div class="panel-head"><div><h2>Пригласите подписчиков</h2><p>Ссылка для вашего сайта или канала</p></div></div>${bot ? `<div class="code-line">https://t.me/${safe(bot)}?start=subscribe</div><button type="button" class="btn btn-secondary btn-small" data-action="copy-bot-link" style="margin-top:13px">${icon('copy', 13)} Скопировать ссылку</button>` : `<div class="notice warm">${icon('info', 15)}<p>Сначала подключите бота в настройках, затем появится его ссылка для подписки.</p></div>`}<p class="settings-note">Telegram разрешает боту написать пользователю только после того, как он сам запустит диалог.</p></section>
     <section class="panel panel-pad"><div class="panel-head"><div><h2>Приватность по умолчанию</h2><p>Подписка и отписка под контролем пользователя</p></div></div><div class="guide-list"><div class="guide-step"><span>01</span><div><strong>/start — подписаться</strong><p>Бот запоминает согласие на сообщения.</p></div></div><div class="guide-step"><span>02</span><div><strong>/stop — отписаться</strong><p>После этой команды рассылки не приходят.</p></div></div></div></section></div></div>`;
 }
@@ -578,6 +578,28 @@ async function doAction(element) {
       lockWorkspace({ signOut: true });
       broadcastAuthLock(true);
       toast('Вы вышли из панели');
+    } catch (error) { toast(error.message, true); }
+    finally { state.pending = false; render(); }
+    return;
+  }
+  if (action === 'cancel-schedule') {
+    if (state.pending) return;
+    state.pending = true; render();
+    try {
+      const result = await api(`/campaigns/${encodeURIComponent(id)}/cancel`, { method: 'POST' });
+      await loadAll({ silent: true });
+      toast(`Расписание отменено; «${result.title || 'кампания'}» снова черновик`);
+    } catch (error) { toast(error.message, true); }
+    finally { state.pending = false; render(); }
+    return;
+  }
+  if (action === 'opt-out') {
+    if (state.pending) return;
+    state.pending = true; render();
+    try {
+      await api(`/subscribers/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify({ opted_in: false }) });
+      await loadAll({ silent: true });
+      toast('Подписчик отписан; запланированные ему отправки отменены');
     } catch (error) { toast(error.message, true); }
     finally { state.pending = false; render(); }
     return;

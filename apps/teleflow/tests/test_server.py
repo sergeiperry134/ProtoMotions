@@ -260,6 +260,188 @@ class HTTPContractTests(ServerCase):
         self.assertEqual(status, 403)
         self.assertEqual(data["error"], "Cross-site request rejected")
 
+    def test_login_lockout_blocks_brute_force_and_recovers(self):
+        class MutableClock:
+            def __init__(self):
+                self.value = dt.datetime(2026, 1, 2, 12, 0, tzinfo=dt.timezone.utc)
+
+            def __call__(self):
+                return self.value
+
+            def advance(self, seconds):
+                self.value += dt.timedelta(seconds=seconds)
+
+        clock = MutableClock()
+        auth_service = TeleflowService(
+            self.root / "auth.sqlite3",
+            telegram=FakeTelegram(),
+            password="correct-password",
+            clock=clock,
+        )
+        self.addCleanup(auth_service.close)
+
+        def auth_handler(*args, **kwargs):
+            return TeleflowRequestHandler(
+                *args, service=auth_service, static_root=self.static, **kwargs
+            )
+
+        auth_server = TeleflowHTTPServer(("127.0.0.1", 0), auth_handler)
+        auth_thread = threading.Thread(target=auth_server.serve_forever, daemon=True)
+        auth_thread.start()
+
+        def cleanup():
+            auth_server.shutdown()
+            auth_server.server_close()
+            auth_thread.join(timeout=2)
+
+        self.addCleanup(cleanup)
+        host, port = auth_server.server_address
+
+        def auth_request(password):
+            connection = http.client.HTTPConnection(host, port, timeout=3)
+            body = json.dumps({"password": password})
+            connection.request(
+                "POST",
+                "/api/login",
+                body=body,
+                headers={
+                    "Origin": f"http://{host}:{port}",
+                    "Content-Type": "application/json",
+                    "Content-Length": str(len(body.encode("utf-8"))),
+                },
+            )
+            response = connection.getresponse()
+            raw = response.read()
+            parsed = json.loads(raw.decode("utf-8")) if raw else {}
+            headers = {key.lower(): value for key, value in response.getheaders()}
+            connection.close()
+            return response.status, parsed, headers
+
+        for _ in range(5):
+            status, data, headers = auth_request("wrong-password")
+            self.assertEqual(status, 401)
+            self.assertEqual(data["error"], "Invalid password")
+            self.assertNotIn("set-cookie", headers)
+
+        status, data, headers = auth_request("correct-password")
+        self.assertEqual(status, 429)
+        self.assertIn("Too many failed login attempts", data["error"])
+        self.assertEqual(headers.get("retry-after"), "900")
+        self.assertNotIn("set-cookie", headers)
+
+        clock.advance(901)
+        status, data, headers = auth_request("correct-password")
+        self.assertEqual(status, 200)
+        self.assertIn("set-cookie", headers)
+
+        for _ in range(5):
+            auth_service.record_login_failure("198.51.100.7")
+        self.assertIsNone(auth_service.login_retry_after("203.0.113.9"))
+        self.assertEqual(auth_service.login_retry_after("198.51.100.7"), 900)
+        auth_service.record_login_success("198.51.100.7")
+        self.assertIsNone(auth_service.login_retry_after("198.51.100.7"))
+
+    def test_cancel_scheduled_campaign_returns_it_to_draft(self):
+        status, created, _ = self.request(
+            "POST",
+            "/api/campaigns",
+            {"title": "Planned", "body": "Hello", "target_type": "subscribers"},
+        )
+        self.assertEqual(status, 201)
+        campaign_id = created["id"]
+        status, scheduled, _ = self.request(
+            "POST",
+            f"/api/campaigns/{campaign_id}/schedule",
+            {"scheduled_at": "2026-01-03T12:00:00Z"},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(scheduled["status"], "scheduled")
+
+        status, cancelled, _ = self.request(
+            "POST", f"/api/campaigns/{campaign_id}/cancel"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(cancelled["status"], "draft")
+        self.assertIsNone(cancelled["scheduled_at"])
+
+        self.service.dispatch_pending()
+        listed = self.request("GET", "/api/campaigns")[1]["items"][0]
+        self.assertEqual(listed["status"], "draft")
+        self.assertEqual(listed["sent_count"], 0)
+        self.assertEqual(self.bot.sent, [])
+
+        status, response, _ = self.request(
+            "POST", f"/api/campaigns/{campaign_id}/cancel"
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(response["error"], "Only scheduled campaigns can be cancelled")
+        status, response, _ = self.request("POST", "/api/campaigns/999/cancel")
+        self.assertEqual(status, 404)
+        self.assertEqual(response["error"], "Campaign not found")
+
+    def test_operator_opt_out_skips_pending_sends_and_cancels_replies(self):
+        self.request(
+            "POST", "/api/rules", {"keyword": "price", "reply": "Pricing details"}
+        )
+        self.push_update(10, "/start")
+        self.request("POST", "/api/sync")
+        self.push_update(11, "What is the PRICE?")
+        self.service.poll_updates()
+
+        status, created, _ = self.request(
+            "POST",
+            "/api/campaigns",
+            {"title": "News", "body": "Update", "target_type": "subscribers"},
+        )
+        self.assertEqual(status, 201)
+        status, _, _ = self.request("POST", f"/api/campaigns/{created['id']}/send")
+        self.assertEqual(status, 202)
+
+        status, response, _ = self.request(
+            "PATCH", "/api/subscribers/42", {"opted_in": False}
+        )
+        self.assertEqual(status, 200)
+        self.assertFalse(response["item"]["opted_in"])
+        self.assertEqual(response["item"]["chat_id"], 42)
+        self.assertFalse(
+            self.request("GET", "/api/subscribers")[1]["items"][0]["opted_in"]
+        )
+
+        self.service.dispatch_pending()
+        finished = self.request("GET", "/api/campaigns")[1]["items"][0]
+        self.assertEqual(finished["status"], "completed")
+        self.assertEqual(finished["sent_count"], 0)
+        self.assertEqual(self.bot.sent, [])
+        with self.service._connection() as connection:
+            reply_states = [
+                row["status"]
+                for row in connection.execute(
+                    "SELECT status FROM reply_queue WHERE chat_id=42"
+                ).fetchall()
+            ]
+        self.assertEqual(reply_states, ["cancelled"])
+
+        status, response, _ = self.request(
+            "PATCH", "/api/subscribers/42", {"opted_in": True}
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(
+            response["error"],
+            "Only the subscriber can restore consent by sending /start",
+        )
+        status, response, _ = self.request(
+            "PATCH", "/api/subscribers/42", {"unsubscribe": True}
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(
+            response["error"], "PATCH subscriber accepts only opted_in boolean"
+        )
+        status, response, _ = self.request(
+            "PATCH", "/api/subscribers/777", {"opted_in": False}
+        )
+        self.assertEqual(status, 404)
+        self.assertEqual(response["error"], "Subscriber not found")
+
     def test_opt_in_stop_campaign_send_and_inbox(self):
         self.push_update(10, "/start", username="ada")
         status, result, _ = self.request("POST", "/api/sync")

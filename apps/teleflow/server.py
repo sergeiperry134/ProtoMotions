@@ -11,6 +11,7 @@ import http.server
 import ipaddress
 import json
 import logging
+import math
 import mimetypes
 import os
 import re
@@ -46,6 +47,9 @@ MAX_BODY_BYTES = 64 * 1024
 MAX_CAMPAIGN_BODY = 4096
 SESSION_COOKIE = "teleflow_session"
 SESSION_TTL_SECONDS = 12 * 60 * 60
+LOGIN_FAILURE_WINDOW_SECONDS = 600
+MAX_LOGIN_FAILURES = 5
+LOGIN_LOCKOUT_SECONDS = 900
 MAX_DELIVERY_ATTEMPTS = 8
 LOG = logging.getLogger("teleflow")
 
@@ -389,6 +393,9 @@ class TeleflowService:
         self._bot_id: int | None = None
         self._sessions: dict[str, float] = {}
         self._sessions_lock = threading.Lock()
+        self._login_lock = threading.Lock()
+        self._login_failures: dict[str, list[dt.datetime]] = {}
+        self._login_locks: dict[str, dt.datetime] = {}
         self._database_lock_fd: int | None = None
         self._database_lock_path = self.db_path.with_name(self.db_path.name + ".lock")
         if account_configured:
@@ -996,6 +1003,22 @@ class TeleflowService:
             self._update_campaign_counts(connection, campaign_id)
             return self._campaign(campaign_id, connection)
 
+    def cancel_campaign_schedule(self, campaign_id: int) -> dict[str, Any]:
+        with self._transaction() as connection:
+            cursor = connection.execute(
+                """UPDATE campaigns SET status='draft', scheduled_at=NULL
+                   WHERE id=? AND status='scheduled'""",
+                (campaign_id,),
+            )
+            if not cursor.rowcount:
+                exists = connection.execute(
+                    "SELECT 1 FROM campaigns WHERE id=?", (campaign_id,)
+                ).fetchone()
+                if exists is None:
+                    raise APIError(404, "Campaign not found")
+                raise APIError(409, "Only scheduled campaigns can be cancelled")
+            return self._campaign(campaign_id, connection)
+
     def _activate_campaign(
         self, campaign_id: int, *, scheduled_only: bool, reject_empty: bool
     ) -> bool:
@@ -1594,6 +1617,31 @@ class TeleflowService:
             for row in rows
         ]
 
+    def opt_out_subscriber(self, chat_id: int) -> dict[str, Any]:
+        with self._transaction() as connection:
+            cursor = connection.execute(
+                "UPDATE subscribers SET opted_in=0 WHERE chat_id=?", (chat_id,)
+            )
+            if not cursor.rowcount:
+                raise APIError(404, "Subscriber not found")
+            connection.execute(
+                """UPDATE reply_queue SET status='cancelled'
+                   WHERE chat_id=? AND status='pending'""",
+                (chat_id,),
+            )
+            row = connection.execute(
+                """SELECT chat_id, first_name, username, opted_in, joined_at
+                   FROM subscribers WHERE chat_id=?""",
+                (chat_id,),
+            ).fetchone()
+            return {
+                "chat_id": int(row["chat_id"]),
+                "first_name": row["first_name"],
+                "username": row["username"],
+                "opted_in": bool(row["opted_in"]),
+                "joined_at": row["joined_at"],
+            }
+
     def list_inbox(self) -> list[dict[str, Any]]:
         with self._connection() as connection:
             rows = connection.execute(
@@ -1846,6 +1894,46 @@ class TeleflowService:
         if token:
             with self._sessions_lock:
                 self._sessions.pop(token, None)
+
+    def login_retry_after(self, peer: str) -> int | None:
+        with self._login_lock:
+            now = self._now()
+            locked_until = self._login_locks.get(peer)
+            if locked_until is not None and locked_until > now:
+                return math.ceil((locked_until - now).total_seconds())
+            self._login_locks.pop(peer, None)
+            window = dt.timedelta(seconds=LOGIN_FAILURE_WINDOW_SECONDS)
+            failures = [
+                stamp
+                for stamp in self._login_failures.get(peer, [])
+                if now - stamp < window
+            ]
+            if failures:
+                self._login_failures[peer] = failures
+            else:
+                self._login_failures.pop(peer, None)
+            return None
+
+    def record_login_failure(self, peer: str) -> None:
+        with self._login_lock:
+            now = self._now()
+            window = dt.timedelta(seconds=LOGIN_FAILURE_WINDOW_SECONDS)
+            failures = [
+                stamp
+                for stamp in self._login_failures.get(peer, [])
+                if now - stamp < window
+            ]
+            failures.append(now)
+            self._login_failures[peer] = failures
+            if len(failures) >= MAX_LOGIN_FAILURES:
+                self._login_locks[peer] = now + dt.timedelta(
+                    seconds=LOGIN_LOCKOUT_SECONDS
+                )
+
+    def record_login_success(self, peer: str) -> None:
+        with self._login_lock:
+            self._login_failures.pop(peer, None)
+            self._login_locks.pop(peer, None)
 
 
 class BackgroundWorker:
@@ -2235,11 +2323,21 @@ class TeleflowRequestHandler(http.server.BaseHTTPRequestHandler):
             if self.service.password is None:
                 self._send_json(200, {"ok": True})
                 return
+            peer = str(self.client_address[0]) if self.client_address else "unknown"
+            retry_after = self.service.login_retry_after(peer)
+            if retry_after is not None:
+                raise APIError(
+                    429,
+                    "Too many failed login attempts; wait before retrying",
+                    retry_after,
+                )
             password = data.get("password")
             if not isinstance(password, str) or not secrets.compare_digest(
                 password.encode("utf-8"), self.service.password.encode("utf-8")
             ):
+                self.service.record_login_failure(peer)
                 raise APIError(401, "Invalid password")
+            self.service.record_login_success(peer)
             token = self.service.issue_session()
             self._set_session_cookie(token, SESSION_TTL_SECONDS)
             self._send_json(200, {"ok": True})
@@ -2256,6 +2354,23 @@ class TeleflowRequestHandler(http.server.BaseHTTPRequestHandler):
 
         if path == "/api/subscribers" and method == "GET":
             self._send_json(200, {"items": self.service.list_subscribers()})
+            return
+        match = re.fullmatch(r"/api/subscribers/(-?\d+)", path)
+        if match:
+            if method != "PATCH":
+                raise APIError(405, "Method not allowed")
+            data = self._read_json()
+            if set(data) != {"opted_in"} or not isinstance(data["opted_in"], bool):
+                raise APIError(400, "PATCH subscriber accepts only opted_in boolean")
+            if data["opted_in"]:
+                raise APIError(
+                    400, "Only the subscriber can restore consent by sending /start"
+                )
+            try:
+                chat_id = int(match.group(1))
+            except ValueError:
+                raise APIError(404, "Subscriber not found") from None
+            self._send_json(200, {"item": self.service.opt_out_subscriber(chat_id)})
             return
         if path == "/api/chats":
             if method == "GET":
@@ -2282,7 +2397,9 @@ class TeleflowRequestHandler(http.server.BaseHTTPRequestHandler):
             else:
                 raise APIError(405, "Method not allowed")
             return
-        match = re.fullmatch(r"/api/campaigns/(\d+)(?:/(schedule|send|retry))?", path)
+        match = re.fullmatch(
+            r"/api/campaigns/(\d+)(?:/(schedule|send|retry|cancel))?", path
+        )
         if match:
             campaign_id = self._require_id(match.group(1), "Campaign")
             action = match.group(2)
@@ -2300,6 +2417,9 @@ class TeleflowRequestHandler(http.server.BaseHTTPRequestHandler):
             elif action == "retry" and method == "POST":
                 self._read_json()
                 self._send_json(202, self.service.retry_failed_campaign(campaign_id))
+            elif action == "cancel" and method == "POST":
+                self._read_json()
+                self._send_json(200, self.service.cancel_campaign_schedule(campaign_id))
             elif action is None and method == "PUT":
                 self._send_json(
                     200, self.service.update_campaign(campaign_id, self._read_json())
