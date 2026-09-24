@@ -178,6 +178,7 @@ class HTTPContractTests(ServerCase):
                 "ai": {"configured": False},
                 "demo": False,
                 "public_demo": False,
+                "accounts": {"enabled": False},
                 "auth_required": False,
             },
         )

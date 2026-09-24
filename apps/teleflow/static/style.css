@@ -77,6 +77,7 @@ svg { flex: none; }
 .connection-pill .signal { height: 7px; width: 7px; border-radius: 50%; background: #1abb83; box-shadow: 0 0 0 3px #d5f4e5; }
 .connection-pill.disconnected .signal { background: #e3ad4c; box-shadow: 0 0 0 3px #fdf0d5; }
 .account-avatar { width: 35px; height: 35px; background: #e9f5f1; border: 1px solid #d6ece5; color: #157e69; border-radius: 10px; font-size: 11px; font-weight: 800; display: grid; place-items: center; }
+.topbar-exit { white-space: nowrap; }
 .menu-toggle { display: none; }
 
 .content { max-width: 1530px; margin: auto; padding: 36px 38px 65px; }
@@ -283,6 +284,31 @@ tr:last-child td { border-bottom: none; }
 .composer input { flex: 1; min-width: 0; }
 .composer .btn { min-height: 37px; }
 .composer-hint { font-size: 9px; color: #9eabb5; margin-top: 8px; }
+.account-warning { margin-bottom: 18px; }
+.account-layout { display: grid; grid-template-columns: minmax(280px, 1fr) minmax(280px, 1fr); gap: 16px; align-items: stretch; margin-bottom: 18px; }
+.account-import, .account-list-panel { min-width: 0; }
+.account-import .field:last-of-type { margin-bottom: 16px; }
+.account-cards { display: grid; gap: 8px; max-height: 248px; overflow-y: auto; }
+.account-card { display: flex; align-items: center; gap: 12px; width: 100%; padding: 11px; text-align: left; background: #fff; border: 1px solid var(--line); border-radius: 10px; color: var(--ink); }
+.account-card:hover, .account-card.selected { border-color: #8ddac9; background: #f0faf7; }
+.account-card span:nth-child(2) { display: grid; gap: 4px; min-width: 0; flex: 1; }
+.account-card strong { font-size: 11px; overflow-wrap: anywhere; }
+.account-card small { color: var(--muted); font-size: 9px; }
+.account-card > svg { color: #8ba5aa; }
+.account-tools { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin: 8px 0 14px; }
+.account-tools strong, .account-tools small { display: block; }
+.account-tools strong { font-size: 13px; }
+.account-tools small { color: var(--muted); font-size: 10px; margin-top: 5px; }
+.account-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+.account-inbox .inbox-list-head strong { font-size: 11px; }
+.account-inbox .inbox-list-head p { margin: 5px 0 0; color: var(--muted); font-size: 9px; line-height: 1.5; }
+.account-inbox .conversation small { display: block; margin-top: 5px; }
+.account-inbox .chat-compose .notice { margin-bottom: 9px; }
+.account-recheck { margin-bottom: 12px; }
+.account-footnote, .account-loading { padding: 16px; color: var(--muted); font-size: 10px; line-height: 1.6; }
+.account-disabled { max-width: 660px; padding: 28px; }
+.account-disabled h2 { font-size: 16px; margin: 16px 0 10px; }
+.account-disabled p { font-size: 11px; color: var(--muted); line-height: 1.8; }
 
 .settings-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; }
 .setting-top { display: flex; align-items: flex-start; gap: 12px; margin-bottom: 16px; }
@@ -352,6 +378,8 @@ tr:last-child td { border-bottom: none; }
   .topbar { height: 65px; padding: 0 17px; }
   .topbar-right { gap: 6px; }
   .topbar-right .icon-button.bordered { display: none; }
+  .topbar-exit { padding: 6px; min-width: 30px; }
+  .topbar-exit span { display: none; }
   .connection-pill { max-width: 120px; overflow: hidden; text-overflow: ellipsis; }
   .content { padding: 25px 16px 45px; }
   .page-heading { align-items: flex-start; flex-wrap: wrap; }
@@ -362,7 +390,8 @@ tr:last-child td { border-bottom: none; }
   .hero-visual { display: none; }
   .stats-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 9px; }
   .stat-card { padding: 15px; min-height: 117px; }
-  .dashboard-grid, .page-grid, .ai-layout, .settings-grid, .modal-grid { grid-template-columns: 1fr; }
+  .dashboard-grid, .page-grid, .ai-layout, .settings-grid, .modal-grid, .account-layout { grid-template-columns: 1fr; }
+  .account-tools { align-items: flex-start; flex-direction: column; }
   .dashboard-stack { gap: 12px; }
   .inbox-shell { grid-template-columns: 1fr; }
   .inbox-shell.has-selection .conversation-list { display: none; }

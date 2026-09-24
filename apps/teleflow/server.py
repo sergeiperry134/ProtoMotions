@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""A small, stdlib-only Telegram campaign server."""
+"""Telegram bot workspace with optional, separate user-account transport."""
 
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ import re
 import secrets
 import socket
 import sqlite3
+import stat
 import threading
 import tempfile
 import time
@@ -26,6 +27,8 @@ import urllib.request
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
+
+from accounts import AccountError, AccountManager
 
 try:
     import fcntl
@@ -316,6 +319,10 @@ class TeleflowService:
         clock: Any = utc_now,
         public_origin: str | None = None,
         public_demo: bool = False,
+        account_api_id: int | None = None,
+        account_api_hash: str | None = None,
+        account_session_key: str | None = None,
+        account_gateway: Any | None = None,
     ):
         self.db_path = Path(db_path).resolve()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -326,6 +333,26 @@ class TeleflowService:
             raise ValueError(
                 "Public demo mode must be unauthenticated and Telegram-disabled"
             )
+        self.accounts: AccountManager | None = None
+        account_configured = any(
+            (account_api_id is not None, account_api_hash, account_session_key)
+        )
+        if account_configured:
+            if self.demo or not self.password:
+                raise ValueError(
+                    "Account mode requires TELEFLOW_PASSWORD and non-demo mode"
+                )
+            if (
+                isinstance(account_api_id, bool)
+                or not isinstance(account_api_id, int)
+                or account_api_id < 1
+                or not account_api_hash
+                or not re.fullmatch(r"[a-fA-F0-9]{32}", account_api_hash)
+                or not account_session_key
+            ):
+                raise ValueError(
+                    "Account mode needs TELEFLOW_API_ID, TELEFLOW_API_HASH and TELEFLOW_SESSION_KEY"
+                )
         self.public_origin = (
             normalize_public_origin(public_origin) if public_origin else None
         )
@@ -364,9 +391,38 @@ class TeleflowService:
         self._sessions_lock = threading.Lock()
         self._database_lock_fd: int | None = None
         self._database_lock_path = self.db_path.with_name(self.db_path.name + ".lock")
+        if account_configured:
+            if self.db_path.parent.stat().st_mode & 0o022:
+                raise ValueError(
+                    "Account mode requires a directory without group/other write access"
+                )
+            try:
+                descriptor = os.open(
+                    self.db_path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600
+                )
+            except FileExistsError:
+                mode = self.db_path.stat().st_mode
+                if not stat.S_ISREG(mode) or mode & 0o077:
+                    raise ValueError(
+                        "Account mode requires a private SQLite database (chmod 600)"
+                    ) from None
+            else:
+                os.close(descriptor)
         self._acquire_database_lock()
         try:
             self._init_db()
+            if account_configured:
+                if account_gateway is None:
+                    from account_transport import TelethonGateway
+
+                    account_gateway = TelethonGateway(account_api_id, account_api_hash)
+                try:
+                    self.accounts = AccountManager(
+                        self, account_session_key, account_gateway
+                    )
+                except BaseException:
+                    account_gateway.close()
+                    raise
         except BaseException:
             self.close()
             raise
@@ -394,18 +450,23 @@ class TeleflowService:
         self._database_lock_fd = descriptor
 
     def close(self) -> None:
-        descriptor = self._database_lock_fd
-        if descriptor is None:
-            return
-        self._database_lock_fd = None
+        accounts = self.accounts
+        self.accounts = None
         try:
-            if fcntl is not None:
-                fcntl.flock(descriptor, fcntl.LOCK_UN)
-            else:  # pragma: no cover - exercised on Windows only
-                os.lseek(descriptor, 0, os.SEEK_SET)
-                msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+            if accounts is not None:
+                accounts.close()
         finally:
-            os.close(descriptor)
+            descriptor = self._database_lock_fd
+            if descriptor is not None:
+                self._database_lock_fd = None
+                try:
+                    if fcntl is not None:
+                        fcntl.flock(descriptor, fcntl.LOCK_UN)
+                    else:  # pragma: no cover - exercised on Windows only
+                        os.lseek(descriptor, 0, os.SEEK_SET)
+                        msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+                finally:
+                    os.close(descriptor)
 
     def _now(self) -> dt.datetime:
         value = self._clock()
@@ -607,6 +668,7 @@ class TeleflowService:
             "ai": {"configured": self._ai_configured},
             "demo": self.demo,
             "public_demo": self.public_demo,
+            "accounts": {"enabled": self.accounts is not None},
             "auth_required": self.password is not None,
         }
 
@@ -2148,7 +2210,13 @@ class TeleflowRequestHandler(http.server.BaseHTTPRequestHandler):
         method = self.command
         if method == "OPTIONS":
             raise APIError(405, "Method not allowed")
-        public_routes = {"/api/health", "/api/status", "/api/login", "/api/logout"}
+        public_routes = {
+            "/api/health",
+            "/api/status",
+            "/api/login",
+            "/api/signout",
+            "/api/logout",
+        }
         mutating = method in {"POST", "PUT", "PATCH", "DELETE"}
         if mutating and not self._origin_is_same():
             raise APIError(403, "Cross-site request rejected")
@@ -2176,10 +2244,14 @@ class TeleflowRequestHandler(http.server.BaseHTTPRequestHandler):
             self._set_session_cookie(token, SESSION_TTL_SECONDS)
             self._send_json(200, {"ok": True})
             return
-        if path == "/api/logout" and method == "POST":
+        if path in {"/api/signout", "/api/logout"} and method == "POST":
             self.service.revoke_session(self._request_cookie())
             self._set_session_cookie("", 0)
             self._send_json(200, {"ok": True})
+            return
+
+        if path == "/api/accounts" or path.startswith("/api/accounts/"):
+            self._handle_accounts(path, method)
             return
 
         if path == "/api/subscribers" and method == "GET":
@@ -2311,6 +2383,106 @@ class TeleflowRequestHandler(http.server.BaseHTTPRequestHandler):
             return
         raise APIError(404, "Not found")
 
+    def _handle_accounts(self, path: str, method: str) -> None:
+        if self.service.password is None or not self.service.valid_session(
+            self._request_cookie()
+        ):
+            raise APIError(401, "Authentication required")
+        accounts = self.service.accounts
+        if accounts is None:
+            raise APIError(403, "User-account integration is disabled")
+        try:
+            if path == "/api/accounts":
+                if method == "GET":
+                    self._send_json(200, {"items": accounts.list_accounts()})
+                elif method == "POST":
+                    data = self._read_json()
+                    self._send_json(
+                        201,
+                        {
+                            "item": accounts.import_session(
+                                data.get("session"), data.get("label")
+                            )
+                        },
+                    )
+                else:
+                    raise APIError(405, "Method not allowed")
+                return
+            match = re.fullmatch(r"/api/accounts/([1-9]\d{0,18})", path)
+            if match:
+                if method != "DELETE":
+                    raise APIError(405, "Method not allowed")
+                accounts.remove(int(match.group(1)))
+                self._send_json(200, {"ok": True, "revoked": True})
+                return
+            match = re.fullmatch(r"/api/accounts/([1-9]\d{0,18})/forget", path)
+            if match:
+                if method != "POST":
+                    raise APIError(405, "Method not allowed")
+                if self._read_json().get("confirm") != "forget_without_revocation":
+                    raise APIError(
+                        400, "Explicit local-forget confirmation is required"
+                    )
+                accounts.remove(int(match.group(1)), revoke=False)
+                self._send_json(200, {"ok": True, "revoked": False})
+                return
+            match = re.fullmatch(r"/api/accounts/([1-9]\d{0,18})/dialogs", path)
+            if match:
+                if method != "GET":
+                    raise APIError(405, "Method not allowed")
+                self._send_json(200, accounts.list_dialogs(int(match.group(1))))
+                return
+            match = re.fullmatch(
+                r"/api/accounts/([1-9]\d{0,18})/dialogs/(-?\d{1,19})/replies/([0-9a-f-]{36})",
+                path,
+            )
+            if match:
+                if method != "GET":
+                    raise APIError(405, "Method not allowed")
+                self._send_json(
+                    200,
+                    accounts.reply_status(
+                        int(match.group(1)), int(match.group(2)), match.group(3)
+                    ),
+                )
+                return
+            match = re.fullmatch(
+                r"/api/accounts/([1-9]\d{0,18})/dialogs/(-?\d{1,19})(?:/(reply|review))?",
+                path,
+            )
+            if match:
+                account_id, dialog_id = int(match.group(1)), int(match.group(2))
+                if match.group(3) == "reply" and method == "POST":
+                    data = self._read_json()
+                    self._send_json(
+                        200,
+                        {
+                            "message": accounts.send_reply(
+                                account_id,
+                                dialog_id,
+                                data.get("body"),
+                                data.get("request_id"),
+                            )
+                        },
+                    )
+                elif match.group(3) == "review" and method == "POST":
+                    data = self._read_json()
+                    accounts.acknowledge_unknown(
+                        account_id,
+                        dialog_id,
+                        data.get("request_id"),
+                        data.get("confirm"),
+                    )
+                    self._send_json(200, {"ok": True})
+                elif match.group(3) is None and method == "GET":
+                    self._send_json(200, accounts.conversation(account_id, dialog_id))
+                else:
+                    raise APIError(405, "Method not allowed")
+                return
+            raise APIError(404, "Not found")
+        except AccountError as error:
+            raise APIError(error.status, error.message, error.retry_after) from None
+
     def _serve_static(self, path: str, *, head_only: bool) -> None:
         if "\\" in path or "\x00" in path:
             self._send_json(404, {"error": "Not found"}, head_only=head_only)
@@ -2415,6 +2587,18 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
     password = os.environ.get("TELEFLOW_PASSWORD") or None
+    account_api_id = None
+    account_api_hash = None
+    account_session_key = None
+    if not args.demo:
+        raw_api_id = os.environ.get("TELEFLOW_API_ID")
+        if raw_api_id:
+            try:
+                account_api_id = int(raw_api_id)
+            except ValueError:
+                parser.error("TELEFLOW_API_ID must be a positive integer")
+        account_api_hash = os.environ.get("TELEFLOW_API_HASH")
+        account_session_key = os.environ.get("TELEFLOW_SESSION_KEY")
     public_demo = is_public_demo_mode(args.host, password, args.demo)
     if not is_loopback_host(args.host) and not public_demo and password is None:
         parser.error(
@@ -2460,6 +2644,9 @@ def main(argv: list[str] | None = None) -> int:
             demo=args.demo,
             public_origin=public_origin,
             public_demo=public_demo,
+            account_api_id=account_api_id,
+            account_api_hash=account_api_hash,
+            account_session_key=account_session_key,
         )
 
         def handler(
@@ -2491,6 +2678,8 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         pass
     except DatabaseInUseError as error:
+        parser.error(str(error))
+    except ValueError as error:
         parser.error(str(error))
     finally:
         if worker is not None:

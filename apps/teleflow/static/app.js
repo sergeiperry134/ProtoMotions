@@ -32,6 +32,7 @@ const glyphs = {
   search: '<circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/>',
   send: '<path d="m22 2-7 20-4-9-9-4 20-7ZM22 2 11 13"/>',
   settings: '<circle cx="12" cy="12" r="3"/><path d="M19 13a7 7 0 0 0 0-2l2-1.5-2-3.5-2.4 1a7 7 0 0 0-1.7-1L14.5 3h-5L9 6a7 7 0 0 0-1.7 1l-2.4-1-2 3.5L5 11a7 7 0 0 0 0 2l-2.1 1.5 2 3.5 2.4-1a7 7 0 0 0 1.7 1l.5 3h5l.4-3a7 7 0 0 0 1.7-1l2.4 1 2-3.5L19 13Z"/>',
+  signout: '<path d="M9 5H5v14h4m4-11 4 4-4 4m4-4H9"/>',
   shield: '<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10Z"/><path d="m9 12 2 2 4-4"/>',
   sparkles: '<path d="m12 3 1.7 5.3L19 10l-5.3 1.7L12 17l-1.7-5.3L5 10l5.3-1.7L12 3ZM19 17l.6 1.4L21 19l-1.4.6L19 21l-.6-1.4L17 19l1.4-.6L19 17Z"/>',
   trash: '<path d="M4 7h16m-14 0 1 13h10l1-13M9 7V4h6v3m-5 4v6m4-6v6"/>',
@@ -55,6 +56,7 @@ const formatTime = value => value && !Number.isNaN(new Date(value).getTime())
 const initials = name => String(name || '?').trim().split(/\s+/).slice(0, 2).map(part => part[0] || '').join('').toUpperCase();
 const displayName = person => person.first_name || person.title || (person.username ? `@${person.username}` : `Чат ${person.chat_id}`);
 const canSend = () => Boolean(state.status?.telegram?.connected && !state.status?.demo);
+const canUseAccounts = () => Boolean(state.status?.accounts?.enabled && !state.status?.demo);
 const canDraftAI = () => Boolean(state.status?.ai?.configured);
 const statuses = { draft: 'Черновик', scheduled: 'Запланирована', sending: 'Отправка', completed: 'Завершена', partial: 'С ошибками', failed: 'Ошибка' };
 const navItems = [
@@ -62,19 +64,82 @@ const navItems = [
   { id: 'campaigns', label: 'Рассылки', icon: 'send', group: 'main' },
   { id: 'people', label: 'Аудитория', icon: 'users', group: 'main' },
   { id: 'inbox', label: 'Входящие', icon: 'inbox', group: 'main' },
+  { id: 'accounts', label: 'Telegram-аккаунты', icon: 'users', group: 'main' },
   { id: 'channels', label: 'Каналы и чаты', icon: 'message', group: 'main' },
   { id: 'ai', label: 'AI-студия', icon: 'sparkles', group: 'tools' },
   { id: 'analytics', label: 'Аналитика', icon: 'chart', group: 'tools' },
   { id: 'settings', label: 'Настройки', icon: 'settings', group: 'tools' },
 ];
 
+const replyAttemptsKey = 'teleflow-account-reply-attempts';
+const authLockKey = 'teleflow-panel-auth-lock';
+
+function readReplyAttempts() {
+  try {
+    const attempts = JSON.parse(sessionStorage.getItem(replyAttemptsKey) || '[]');
+    if (!Array.isArray(attempts)) return [];
+    return attempts.filter(item => item && typeof item.accountId === 'string' && /^[1-9]\d{0,18}$/.test(item.accountId)
+      && typeof item.dialogId === 'string' && /^-?\d{1,19}$/.test(item.dialogId)
+      && typeof item.requestId === 'string' && /^[0-9a-f-]{36}$/.test(item.requestId));
+  } catch { return []; }
+}
+
 const state = {
   route: location.hash.slice(1).split('?')[0] || 'overview',
   loading: true, authGate: false, sidebarOpen: false, pending: false,
   status: null, campaigns: [], subscribers: [], chats: [], inbox: [], rules: [], analytics: null,
   selectedChat: null, messages: [], contact: null, modal: null, aiText: '',
+  accounts: [], selectedAccount: null, accountDialogs: [], accountDialogsTruncated: false,
+  selectedAccountDialog: null, accountConversation: null, accountLoading: false, replyAttempts: readReplyAttempts(),
   filters: { campaigns: 'all', people: 'all', campaignSearch: '', audienceSearch: '', inboxSearch: '' },
 };
+
+let authVersion = 0;
+
+function replyAttemptFor(accountId, dialogId) {
+  return state.replyAttempts.find(item => item.accountId === String(accountId) && item.dialogId === String(dialogId));
+}
+
+function persistReplyAttempts(attempts) {
+  sessionStorage.setItem(replyAttemptsKey, JSON.stringify(attempts.map(({ accountId, dialogId, requestId }) => ({ accountId, dialogId, requestId }))));
+  state.replyAttempts = attempts;
+}
+
+function rememberReplyAttempt(accountId, dialogId, requestId) {
+  const attempts = state.replyAttempts.filter(item => item.accountId !== accountId || item.dialogId !== dialogId);
+  attempts.push({ accountId, dialogId, requestId, status: 'checking' });
+  try { persistReplyAttempts(attempts); }
+  catch { throw new Error('Не удалось сохранить идентификатор попытки в этой вкладке; сообщение не отправлено'); }
+}
+
+function forgetReplyAttempt(accountId, dialogId, requestId = null) {
+  persistReplyAttempts(state.replyAttempts.filter(item => item.accountId !== accountId || item.dialogId !== dialogId || (requestId && item.requestId !== requestId)));
+}
+
+function lockWorkspace({ signOut = false } = {}) {
+  authVersion += 1;
+  if (signOut) { try { sessionStorage.removeItem(replyAttemptsKey); } catch { /* Private storage may be disabled. */ } }
+  Object.assign(state, {
+    loading: false, authGate: true, sidebarOpen: false, pending: false, status: null,
+    campaigns: [], subscribers: [], chats: [], inbox: [], rules: [], analytics: null,
+    selectedChat: null, messages: [], contact: null, modal: null, aiText: '',
+    accounts: [], selectedAccount: null, accountDialogs: [], accountDialogsTruncated: false,
+    selectedAccountDialog: null, accountConversation: null, accountLoading: false, replyAttempts: [],
+    filters: { campaigns: 'all', people: 'all', campaignSearch: '', audienceSearch: '', inboxSearch: '' },
+  });
+  render();
+}
+
+function broadcastAuthLock(signOut) {
+  try { localStorage.setItem(authLockKey, JSON.stringify({ signOut, nonce: crypto.randomUUID() })); }
+  catch { /* Other tabs still recheck authorization when they become visible. */ }
+}
+
+function recheckAuthorization() {
+  if (state.status?.auth_required && !state.authGate) {
+    api('/campaigns').catch(error => { if (!state.authGate) toast(error.message, true); });
+  }
+}
 
 async function api(path, options = {}) {
   const response = await fetch(`/api${path}`, {
@@ -85,8 +150,13 @@ async function api(path, options = {}) {
   let payload;
   try { payload = await response.json(); } catch { payload = {}; }
   if (!response.ok) {
-    if (response.status === 401 && path !== '/login') { state.authGate = true; render(); }
-    throw new Error(payload.error || `Ошибка запроса (${response.status})`);
+    if (response.status === 401 && payload.error === 'Authentication required' && !state.authGate) {
+      lockWorkspace();
+      broadcastAuthLock(false);
+    }
+    const error = new Error(payload.error || `Ошибка запроса (${response.status})`);
+    error.status = response.status;
+    throw error;
   }
   return payload;
 }
@@ -100,24 +170,33 @@ function toast(message, error = false) {
 }
 
 async function loadAll({ silent = false } = {}) {
+  const version = authVersion;
   if (!silent) { state.loading = true; render(); }
   try {
-    state.status = await api('/status');
-    const [campaigns, subscribers, chats, inbox, rules, analytics] = await Promise.all([
+    const status = await api('/status');
+    if (version !== authVersion) return;
+    state.status = status;
+    const [campaigns, subscribers, chats, inbox, rules, analytics, accounts] = await Promise.all([
       api('/campaigns'), api('/subscribers'), api('/chats'), api('/inbox'), api('/rules'), api('/analytics'),
+      canUseAccounts() ? api('/accounts') : Promise.resolve({ items: [] }),
     ]);
+    if (version !== authVersion) return;
     Object.assign(state, {
       campaigns: campaigns.items || [], subscribers: subscribers.items || [], chats: chats.items || [],
-      inbox: inbox.items || [], rules: rules.items || [], analytics,
+      inbox: inbox.items || [], rules: rules.items || [], analytics, accounts: accounts.items || [],
       authGate: false,
     });
+    if (state.selectedAccount && !state.accounts.some(item => String(item.id) === state.selectedAccount)) {
+      state.selectedAccount = null; state.accountDialogs = []; state.selectedAccountDialog = null;
+      state.accountConversation = null;
+    }
     if (state.selectedChat && !state.inbox.some(chat => String(chat.chat_id) === String(state.selectedChat))) {
       state.selectedChat = null; state.messages = [];
     }
     render();
   } catch (error) {
-    if (!state.authGate) toast(error.message, true);
-  } finally { state.loading = false; render(); }
+    if (version === authVersion && !state.authGate) toast(error.message, true);
+  } finally { if (version === authVersion) { state.loading = false; render(); } }
 }
 
 function navigate(route) {
@@ -139,7 +218,7 @@ function sidebar() {
       ${brand()}
       <nav><div class="nav-section"><p class="nav-label">Рабочее пространство</p>${links('main')}</div><div class="nav-section"><p class="nav-label">Инструменты</p>${links('tools')}</div></nav>
       <div class="sidebar-bottom"><div class="help-box"><div class="help-box-icon">${icon('help', 17)}</div><strong>Нужна помощь?</strong><p>Подключите бота и начните работу за несколько минут.</p><button type="button" data-nav="settings">Инструкция по запуску ${icon('arrow', 13)}</button></div>
-      <div class="sidebar-foot"><span class="sidebar-foot-icon">${icon('shield', 16)}</span><span><strong>Безопасная отправка</strong><small>Только по подписке</small></span></div></div>
+      <div class="sidebar-foot"><span class="sidebar-foot-icon">${icon('shield', 16)}</span><span><strong>Безопасная отправка</strong><small>${canUseAccounts() ? 'Подписка или ручной ответ' : 'Только по подписке'}</small></span></div></div>
     </aside>`;
 }
 
@@ -148,7 +227,7 @@ function topbar() {
   const botName = state.status?.telegram?.username;
   return `<header class="topbar"><div class="topbar-left"><button type="button" class="icon-button menu-toggle" data-action="toggle-sidebar" aria-label="Открыть меню">${icon('menu', 19)}</button><div class="breadcrumb">Рабочее пространство <span>/</span> <strong>${page.label}</strong></div></div>
     <div class="topbar-right"><button type="button" class="icon-button bordered" data-action="refresh" aria-label="Обновить данные" title="Обновить">${icon('refresh', 16)}</button>
-    <button type="button" class="connection-pill${canSend() ? '' : ' disconnected'}" data-nav="settings"><i class="signal"></i>${canSend() ? `@${safe(botName || 'бот подключён')}` : state.status?.demo ? 'Демо-режим' : 'Бот не подключён'}</button><span class="account-avatar">TF</span></div></header>`;
+    <button type="button" class="connection-pill${canSend() ? '' : ' disconnected'}" data-nav="settings"><i class="signal"></i>${canSend() ? `@${safe(botName || 'бот подключён')}` : state.status?.demo ? 'Демо-режим' : 'Бот не подключён'}</button>${state.status?.auth_required ? `<button type="button" class="btn btn-secondary btn-small topbar-exit" data-action="sign-out" aria-label="Выйти из панели" ${state.pending ? 'disabled' : ''}>${icon('signout', 13)}<span>Выйти</span></button>` : ''}<span class="account-avatar">TF</span></div></header>`;
 }
 
 function banner() {
@@ -284,6 +363,49 @@ function analyticsPage() {
     <section class="panel" style="margin-top:18px"><div class="panel-head" style="padding:19px 19px 0"><div><h2>Результаты кампаний</h2><p>Статус и успешные отправки</p></div></div>${campaignRows(state.campaigns.filter(item => ['completed','partial','failed','sending'].includes(item.status)), true)}</section>`;
 }
 
+function accountReplyNotice(attempt, unresolved) {
+  if (unresolved.length) {
+    const unknown = unresolved.filter(item => item.state === 'unknown');
+    return `<div class="notice warm">${icon('warning', 15)}<p>${unknown.length ? 'Исход отправки неизвестен. Проверьте этот диалог в Telegram, прежде чем писать снова.' : 'Отправка ещё выполняется. Обновите диалог, чтобы проверить её состояние.'} Повторное сообщение может продублироваться.</p></div>
+      ${unknown.map(item => `<button type="button" class="btn btn-secondary btn-small account-recheck" data-action="review-account-reply" data-id="${safe(item.request_id)}">Проверил Telegram · попытка ${formatTime(item.created_at)}</button>`).join('')}
+      ${unresolved.some(item => item.state === 'pending') ? `<button type="button" class="btn btn-secondary btn-small account-recheck" data-action="refresh-account-dialog">${icon('refresh', 13)} Проверить состояние</button>` : ''}`;
+  }
+  if (!attempt) return '';
+  if (attempt.status === 'sent') return `<div class="notice">${icon('check', 15)}<p>Ответ уже отправлен и записан в TeleFlow. Не отправляйте его повторно.</p></div><button type="button" class="btn btn-secondary btn-small account-recheck" data-action="acknowledge-reply">Понятно — новый ответ</button>`;
+  if (attempt.status === 'missing') return `<div class="notice warm">${icon('warning', 15)}<p>Запись об этой попытке не найдена. Перед новым ответом проверьте диалог в Telegram: прежнее сообщение могло быть доставлено.</p></div><button type="button" class="btn btn-secondary btn-small account-recheck" data-action="acknowledge-reply">Проверил Telegram — новый ответ</button>`;
+  return `<div class="notice warm">${icon('warning', 15)}<p>Состояние попытки пока не подтверждено. Не отправляйте ответ повторно до проверки.</p></div><button type="button" class="btn btn-secondary btn-small account-recheck" data-action="refresh-account-dialog">${icon('refresh', 13)} Проверить состояние</button>`;
+}
+
+function accountInbox() {
+  const selected = state.accountDialogs.find(item => String(item.id) === state.selectedAccountDialog);
+  const conversation = state.accountConversation;
+  const unresolved = conversation?.unresolved || [];
+  const attempt = replyAttemptFor(state.selectedAccount, state.selectedAccountDialog);
+  const blocked = Boolean(attempt || unresolved.length);
+  const canReply = Boolean(conversation?.can_send && !blocked && !state.accountLoading && !state.pending);
+  const kind = { private: 'Личный диалог', channel: 'Ваш канал', group: 'Ваша группа' };
+  return `<section class="panel inbox-shell account-inbox${selected ? ' has-selection' : ''}">
+    <div class="conversation-list"><div class="inbox-list-head"><strong>Существующие диалоги</strong><p>Первые 100 чатов аккаунта · только доступные для ответа</p></div>
+      ${state.accountLoading && !state.accountDialogs.length ? `<div class="account-loading" role="status">Загружаем диалоги…</div>` : state.accountDialogs.length ? state.accountDialogs.map(item => `<button class="conversation${String(item.id) === state.selectedAccountDialog ? ' selected' : ''}" type="button" data-action="select-account-dialog" data-id="${safe(item.id)}" ${state.accountLoading ? 'disabled' : ''}><span class="avatar">${safe(initials(item.name))}</span><span class="conversation-copy"><strong>${safe(item.name)}</strong><small>${safe(kind[item.kind] || item.kind)}</small></span></button>`).join('') : empty('inbox', 'Диалогов пока нет', 'Можно отвечать только в существующих личных диалогах или публиковать в своих чатах.', '', true)}
+      ${state.accountDialogsTruncated ? `<div class="account-footnote">Показаны только первые 100 диалогов. Поиск по всей истории пока недоступен.</div>` : ''}</div>
+    <div class="chat-area">${selected ? `<div class="chat-head"><button type="button" class="icon-button chat-back" data-action="back-account-dialogs" aria-label="К списку диалогов">${icon('back', 16)}</button><span class="avatar">${safe(initials(selected.name))}</span><span><strong>${safe(selected.name)}</strong><small>${safe(kind[selected.kind] || selected.kind)}</small></span></div>
+      <div class="chat-messages" id="accountMessages">${state.accountLoading && !conversation ? `<div class="account-loading" role="status">Загружаем историю…</div>` : conversation?.items?.length ? conversation.items.map(item => `<div class="message ${item.out ? 'out' : 'in'}"><div class="message-bubble">${safe(item.body)}</div><time>${formatTime(item.created_at)}</time></div>`).join('') : empty('message', 'История пуста', 'Здесь видны последние 40 сообщений; медиафайлы не загружаются.', '', true)}</div>
+      <div class="chat-compose">${accountReplyNotice(attempt, unresolved)}
+        <form id="accountReplyForm" class="composer"><input name="body" maxlength="4096" placeholder="Написать ответ…" aria-label="Текст ответа аккаунта" autocomplete="off" required ${canReply ? '' : 'disabled'} /><button class="btn" type="submit" ${canReply ? '' : 'disabled'}>${icon('send', 14)} Отправить</button></form>
+        <div class="composer-hint">${selected.kind === 'private' ? 'Только ручной ответ в диалоге с входящим сообщением. /start бота не считается согласием.' : 'Публикация вручную: только ваш канал или группа.'}${conversation && !conversation.can_send && selected.kind === 'private' && !blocked ? ' В этом личном диалоге нет входящего сообщения среди последних 100 — отправка запрещена.' : ''}</div></div>` : empty('message', 'Выберите диалог', 'История откроется после выбора существующего чата.', '', false)}</div></section>`;
+}
+
+function accountsPage() {
+  const introduction = `${heading('Telegram-аккаунты', 'Отдельный от бота кабинет для своих существующих диалогов и каналов.')}
+    <div class="notice warm account-warning">${icon('lock', 17)}<p><strong>StringSession даёт полный доступ к вашему Telegram-аккаунту.</strong> Создавайте её только на доверенном устройстве, вводите исключительно на защищённой установке TeleFlow и не передавайте в чат, ссылки, логи или публичное демо. TeleFlow не сохраняет сессию в браузере; не разрешайте менеджеру паролей запоминать это поле.</p></div>`;
+  if (!canUseAccounts()) return `${introduction}<section class="panel panel-pad account-disabled"><span class="setting-icon">${icon('shield', 20)}</span><h2>Доступно только в защищённой установке</h2><p>В демо личные аккаунты отключены. Для своего сервера установите дополнительные зависимости, задайте TELEFLOW_API_ID, TELEFLOW_API_HASH, TELEFLOW_SESSION_KEY и обязательный TELEFLOW_PASSWORD; за пределами localhost нужен HTTPS и TELEFLOW_PUBLIC_ORIGIN. Генерируйте готовую авторизованную StringSession локально по инструкции в README.</p><p>Демо не просит ключи и не отправляет сообщения в Telegram.</p></section>`;
+  const active = state.accounts.find(item => String(item.id) === state.selectedAccount);
+  return `${introduction}<div class="account-layout"><section class="panel panel-pad account-import"><div class="panel-head"><div><h2>Подключить свой аккаунт</h2><p>Импорт уже авторизованной Telethon StringSession · вход по номеру здесь не выполняется</p></div></div>
+    <form id="accountImportForm" autocomplete="off"><div class="field"><label for="accountLabel">Метка аккаунта</label><input id="accountLabel" name="label" maxlength="80" placeholder="Например, основной" autocomplete="off" /></div><div class="field"><label for="accountSession">StringSession</label><input id="accountSession" name="session" type="password" maxlength="8192" placeholder="Вставьте готовую сессию" autocomplete="off" spellcheck="false" required /><small class="field-help">Поле очищается сразу после отправки. Сессия хранится на сервере только в зашифрованном виде.</small></div><button class="btn" type="submit" ${state.pending ? 'disabled' : ''}>${icon('plus', 14)} Подключить</button></form></section>
+    <section class="panel panel-pad account-list-panel"><div class="panel-head"><div><h2>Подключённые аккаунты</h2><p>Видны всем, кто знает пароль этой панели</p></div><span class="stat-icon">${icon('users', 17)}</span></div>${state.accounts.length ? `<div class="account-cards">${state.accounts.map(item => `<button type="button" class="account-card${String(item.id) === state.selectedAccount ? ' selected' : ''}" data-action="select-account" data-id="${safe(item.id)}" ${state.accountLoading ? 'disabled' : ''}><span class="avatar">${safe(initials(item.display_name))}</span><span><strong>${safe(item.display_name)}</strong><small>${item.username ? `@${safe(item.username)}` : `ID ${safe(item.id)}`}</small></span>${icon('chevron', 16)}</button>`).join('')}</div>` : empty('users', 'Аккаунтов пока нет', 'Подключите только аккаунт, который принадлежит вам.', '', true)}</section></div>
+    ${active ? `<div class="account-tools"><div><strong>${safe(active.display_name)}</strong><small>Ручные действия в Telegram · без автоматических рассылок</small></div><div class="account-actions"><button type="button" class="btn btn-secondary btn-small" data-action="refresh-account" ${state.accountLoading || state.pending ? 'disabled' : ''}>${icon('refresh', 13)} Обновить диалоги</button><button type="button" class="btn btn-danger btn-small" data-action="revoke-account" data-id="${safe(active.id)}" ${state.accountLoading || state.pending ? 'disabled' : ''}>Отозвать сессию</button><button type="button" class="text-link" data-action="forget-account" data-id="${safe(active.id)}" ${state.accountLoading || state.pending ? 'disabled' : ''}>Только удалить локально</button></div></div>${accountInbox()}` : `<section class="panel">${empty('inbox', 'Выберите аккаунт', 'После выбора увидите его существующие диалоги. TeleFlow не ищет незнакомых адресатов.', '', false)}</section>`}`;
+}
+
 function settingsPage() {
   const telegram = state.status?.telegram || {};
   return `${heading('Настройки', 'Подключения и безопасность вашего рабочего пространства.')}${banner()}
@@ -292,7 +414,7 @@ function settingsPage() {
     ${telegram.error && telegram.error !== 'TELEFLOW_BOT_TOKEN is not configured' ? `<div class="notice warm" style="margin-top:17px">${icon('warning', 15)}<p>${safe(telegram.error)}</p></div>` : ''}<div style="margin-top:19px;display:flex;gap:8px;flex-wrap:wrap"><button type="button" class="btn btn-secondary btn-small" data-action="refresh">${icon('refresh', 13)} Проверить статус</button><button type="button" class="btn btn-secondary btn-small" data-action="sync" ${canSend() ? '' : 'disabled'}>${icon('inbox', 13)} Получить сообщения</button></div></section>
     <section class="panel panel-pad"><div class="setting-top"><span class="setting-icon blue">${icon('sparkles', 19)}</span><div><h2>AI-помощник</h2><p>Черновики текстов и подсказки для ответов</p></div></div><div class="setting-status"><strong>${canDraftAI() ? `${icon('check', 13)} Настроен` : `${icon('info', 13)} Не настроен`}</strong><span>OpenAI API</span></div><p class="settings-note">Для AI-функций добавьте ключ в окружение сервера. Ключ остаётся на сервере и не передаётся браузеру.</p><code class="code-line" style="margin-top:14px">OPENAI_API_KEY=ваш_ключ</code><button type="button" class="text-link" style="margin-top:17px" data-nav="ai">Перейти в AI-студию ${icon('arrow', 13)}</button></section>
     <section class="panel panel-pad"><div class="setting-top"><span class="setting-icon">${icon('shield', 19)}</span><div><h2>Доступ и данные</h2><p>Защита при размещении за пределами локального компьютера</p></div></div><p class="settings-note">Для доступа из сети установите пароль <code>TELEFLOW_PASSWORD</code>, укажите доверенный адрес <code>TELEFLOW_PUBLIC_ORIGIN</code> и используйте HTTPS. Токен бота и ключ AI не сохраняются в браузере.</p><div class="notice" style="margin-top:15px">${icon('lock', 15)}<p>База данных хранится локально на сервере. Не публикуйте её и включите резервное копирование при постоянном использовании.</p></div></section>
-    <section class="panel panel-pad"><div class="setting-top"><span class="setting-icon blue">${icon('info', 19)}</span><div><h2>Границы интеграции</h2><p>Прозрачные правила работы Telegram-бота</p></div></div><p class="settings-note">TeleFlow работает через официальный Bot API: не подключает личные аккаунты, не собирает участников чужих групп, не отправляет сообщения людям без подписки и не накручивает реакции. Для каналов требуются права администратора.</p><a class="text-link" style="margin-top:17px" href="https://core.telegram.org/bots/api" target="_blank" rel="noopener noreferrer">Документация Telegram ${icon('external', 13)}</a></section></div>`;
+    <section class="panel panel-pad"><div class="setting-top"><span class="setting-icon blue">${icon('info', 19)}</span><div><h2>Границы интеграции</h2><p>Отдельные правила для бота и личных аккаунтов</p></div></div><p class="settings-note">Бот работает через Bot API и отправляет сообщения только подписчикам или в проверенные свои чаты. Опциональный Telethon-модуль даёт владельцу аккаунта ручной доступ к существующим диалогам, но не собирает участников чужих групп, не рассылает незнакомым людям и не накручивает реакции. /start бота не даёт права писать от личного аккаунта.</p><button type="button" class="text-link" style="margin-top:17px" data-nav="accounts">Telegram-аккаунты ${icon('arrow', 13)}</button></section></div>`;
 }
 
 function modal() {
@@ -334,6 +456,20 @@ function modal() {
   } else if (data.type === 'delete') {
     title = 'Удалить безвозвратно?'; description = 'Это действие нельзя отменить.';
     content = `<p style="color:var(--muted);font-size:11px;line-height:1.7;margin:0">${safe(data.label || 'Выбранный объект')} будет удалён из рабочего пространства.</p><div class="modal-footer"><button class="btn btn-secondary" type="button" data-action="close-modal">Отмена</button><button class="btn btn-danger" type="button" data-action="confirm-delete" ${state.pending ? 'disabled' : ''}>${icon('trash', 14)} Удалить</button></div>`;
+  } else if (data.type === 'account-revoke' || data.type === 'account-forget') {
+    const account = state.accounts.find(item => String(item.id) === data.id);
+    const forget = data.type === 'account-forget';
+    title = forget ? 'Забыть аккаунт без отзыва?' : 'Отозвать Telegram-сессию?';
+    description = account?.display_name || 'Выбранный аккаунт';
+    content = `<div class="notice warm">${icon('warning', 16)}<p>${forget ? 'Удалится только зашифрованная копия в TeleFlow. Telegram-сессия останется действующей — завершите её вручную в настройках Telegram «Устройства».' : 'TeleFlow запросит выход в Telegram и только после подтверждения удалит локальную сессию. Эта авторизация перестанет работать и в других копиях.'}</p></div><div class="modal-footer"><button type="button" class="btn btn-secondary" data-action="close-modal">Отмена</button><button type="button" class="btn btn-danger" data-action="${forget ? 'confirm-forget-account' : 'confirm-revoke-account'}" ${state.pending ? 'disabled' : ''}>${icon('trash', 14)} ${forget ? 'Только удалить локально' : 'Отозвать и удалить'}</button></div>`;
+  } else if (data.type === 'account-review') {
+    title = 'Вы проверили диалог в Telegram?';
+    description = 'Проверьте, было ли доставлено сообщение с неизвестным исходом.';
+    content = `<div class="notice warm">${icon('warning', 16)}<p>TeleFlow не знает результат этой попытки. Подтверждение только снимет блокировку новых ответов в этом диалоге; оно не отправляет сообщение и не доказывает доставку. При нескольких попытках проверьте каждую.</p></div><div class="modal-footer"><button type="button" class="btn btn-secondary" data-action="close-modal">Ещё не проверил</button><button type="button" class="btn" data-action="confirm-review-account-reply" ${state.pending ? 'disabled' : ''}>Проверил в Telegram</button></div>`;
+  } else if (data.type === 'account-local-review') {
+    title = 'Вы проверили диалог в Telegram?';
+    description = 'Запись о попытке отсутствует в TeleFlow.';
+    content = `<div class="notice warm">${icon('warning', 16)}<p>Найдите это сообщение в Telegram перед новым ответом. Подтверждение снимет только блокировку в этой вкладке: оно не отправляет сообщение и не доказывает, что прежняя попытка не была доставлена.</p></div><div class="modal-footer"><button type="button" class="btn btn-secondary" data-action="close-modal">Ещё не проверил</button><button type="button" class="btn" data-action="confirm-acknowledge-reply">Проверил в Telegram</button></div>`;
   }
   return `<div class="modal-layer" data-action="close-modal"><section class="modal${wide ? ' wide' : ''}" role="dialog" aria-modal="true" aria-label="${safe(title)}"><div class="modal-header"><div><h2>${safe(title)}</h2><p>${safe(description)}</p></div><button type="button" class="icon-button" data-action="close-modal" aria-label="Закрыть окно">${icon('close', 18)}</button></div><div class="modal-body">${content}</div></section></div>`;
 }
@@ -345,7 +481,7 @@ function loginPage() {
 function render() {
   if (state.authGate) { root.innerHTML = loginPage(); return; }
   if (state.loading && !state.status) { root.innerHTML = `<div class="initial-loader"><span class="loader"></span><span>Загружаем рабочее пространство…</span></div>`; return; }
-  const pages = { overview, campaigns: campaignsPage, people: audiencePage, inbox: inboxPage, channels: channelsPage, ai: aiPage, analytics: analyticsPage, settings: settingsPage };
+  const pages = { overview, campaigns: campaignsPage, people: audiencePage, inbox: inboxPage, accounts: accountsPage, channels: channelsPage, ai: aiPage, analytics: analyticsPage, settings: settingsPage };
   if (!pages[state.route]) state.route = 'overview';
   root.innerHTML = `<div class="app-shell">${sidebar()}<div class="main">${topbar()}<main class="content">${pages[state.route]()}</main></div>${modal()}</div>`;
   if (!canSend()) root.querySelectorAll('[data-action="schedule-campaign"]').forEach(button => {
@@ -357,6 +493,61 @@ function render() {
     const messages = document.getElementById('chatMessages');
     if (messages) messages.scrollTop = messages.scrollHeight;
   }
+  if (state.route === 'accounts' && state.selectedAccountDialog) {
+    const messages = document.getElementById('accountMessages');
+    if (messages) messages.scrollTop = messages.scrollHeight;
+  }
+}
+
+async function selectAccount(accountId) {
+  if (state.accountLoading) return;
+  state.selectedAccount = String(accountId);
+  state.selectedAccountDialog = null; state.accountConversation = null;
+  state.accountDialogs = []; state.accountDialogsTruncated = false;
+  state.accountLoading = true; render();
+  try {
+    const result = await api(`/accounts/${encodeURIComponent(accountId)}/dialogs`);
+    if (state.selectedAccount === String(accountId)) {
+      state.accountDialogs = result.items || [];
+      state.accountDialogsTruncated = Boolean(result.truncated);
+    }
+  } catch (error) { toast(error.message, true); }
+  finally { state.accountLoading = false; render(); }
+}
+
+async function inspectReplyAttempt(accountId, dialogId) {
+  const attempt = replyAttemptFor(accountId, dialogId);
+  if (!attempt) return;
+  try {
+    const result = await api(`/accounts/${encodeURIComponent(accountId)}/dialogs/${encodeURIComponent(dialogId)}/replies/${attempt.requestId}`);
+    if (state.authGate || replyAttemptFor(accountId, dialogId) !== attempt) return;
+    if (result.reviewed || result.state === 'rejected') {
+      forgetReplyAttempt(accountId, dialogId, attempt.requestId);
+      if (result.state === 'rejected') toast('Предыдущая отправка отклонена; можно подготовить новый ответ');
+    } else {
+      attempt.status = result.state;
+      if (result.state === 'sent') toast('Ответ уже отправлен; не повторяйте его');
+    }
+  } catch (error) {
+    if (state.authGate || replyAttemptFor(accountId, dialogId) !== attempt) return;
+    attempt.status = error.status === 404 ? 'missing' : 'unavailable';
+    if (error.status !== 404) toast(error.message, true);
+  }
+}
+
+async function selectAccountDialog(dialogId) {
+  if (state.accountLoading || !state.selectedAccount) return;
+  const accountId = state.selectedAccount;
+  state.selectedAccountDialog = String(dialogId);
+  state.accountConversation = null; state.accountLoading = true; render();
+  try {
+    const result = await api(`/accounts/${encodeURIComponent(accountId)}/dialogs/${encodeURIComponent(dialogId)}`);
+    if (state.selectedAccount === accountId && state.selectedAccountDialog === String(dialogId)) {
+      state.accountConversation = result;
+      await inspectReplyAttempt(accountId, String(dialogId));
+    }
+  } catch (error) { if (!state.authGate) toast(error.message, true); }
+  finally { state.accountLoading = false; render(); }
 }
 
 async function selectChat(chatId) {
@@ -378,7 +569,88 @@ async function doAction(element) {
   if (action === 'toggle-sidebar') { state.sidebarOpen = !state.sidebarOpen; render(); return; }
   if (action === 'close-sidebar') { state.sidebarOpen = false; render(); return; }
   if (action === 'close-modal') { state.modal = null; render(); return; }
-  if (action === 'refresh') { await loadAll(); toast('Данные обновлены'); return; }
+  if (action === 'refresh') { await loadAll(); if (!state.authGate) toast('Данные обновлены'); return; }
+  if (action === 'sign-out') {
+    if (state.pending) return;
+    state.pending = true; render();
+    try {
+      await api('/signout', { method: 'POST' });
+      lockWorkspace({ signOut: true });
+      broadcastAuthLock(true);
+      toast('Вы вышли из панели');
+    } catch (error) { toast(error.message, true); }
+    finally { state.pending = false; render(); }
+    return;
+  }
+  if (action === 'select-account') { if (!state.pending) await selectAccount(id); return; }
+  if (action === 'select-account-dialog') { if (!state.pending) await selectAccountDialog(id); return; }
+  if (action === 'refresh-account') { if (!state.pending && state.selectedAccount) await selectAccount(state.selectedAccount); return; }
+  if (action === 'refresh-account-dialog') { if (!state.pending && state.selectedAccountDialog) await selectAccountDialog(state.selectedAccountDialog); return; }
+  if (action === 'back-account-dialogs') { state.selectedAccountDialog = null; state.accountConversation = null; render(); return; }
+  if (action === 'acknowledge-reply' && !state.accountConversation?.unresolved?.length) {
+    const attempt = replyAttemptFor(state.selectedAccount, state.selectedAccountDialog);
+    if (attempt?.status === 'sent') {
+      try { forgetReplyAttempt(attempt.accountId, attempt.dialogId); render(); }
+      catch (error) { toast(error.message, true); }
+    } else if (attempt?.status === 'missing') {
+      state.modal = { type: 'account-local-review', accountId: attempt.accountId, dialogId: attempt.dialogId, requestId: attempt.requestId }; render();
+    }
+    return;
+  }
+  if (action === 'confirm-acknowledge-reply' && state.modal?.type === 'account-local-review') {
+    if (state.pending) return;
+    const { accountId, dialogId, requestId } = state.modal;
+    state.pending = true;
+    try {
+      await inspectReplyAttempt(accountId, dialogId);
+      if (replyAttemptFor(accountId, dialogId)?.requestId === requestId && replyAttemptFor(accountId, dialogId)?.status === 'missing' && !state.accountConversation?.unresolved?.length) {
+        forgetReplyAttempt(accountId, dialogId, requestId);
+        state.modal = null;
+        toast('Попытка проверена; нового сообщения не отправлено');
+      } else { state.modal = null; await selectAccountDialog(dialogId); }
+    } catch (error) { toast(error.message, true); }
+    finally { state.pending = false; render(); }
+    return;
+  }
+  if (action === 'review-account-reply' && state.accountConversation?.unresolved?.some(item => item.request_id === id && item.state === 'unknown')) {
+    state.modal = { type: 'account-review', accountId: state.selectedAccount, dialogId: state.selectedAccountDialog, requestId: id }; render(); return;
+  }
+  if (action === 'confirm-review-account-reply') {
+    if (state.pending || state.modal?.type !== 'account-review') return;
+    const { accountId, dialogId, requestId } = state.modal;
+    state.pending = true; render();
+    try {
+      await api(`/accounts/${encodeURIComponent(accountId)}/dialogs/${encodeURIComponent(dialogId)}/review`, {
+        method: 'POST', body: JSON.stringify({ request_id: requestId, confirm: 'checked_in_telegram' }),
+      });
+      state.modal = null; forgetReplyAttempt(accountId, dialogId, requestId);
+      await selectAccountDialog(dialogId);
+      toast('Попытка отмечена как проверенная; нового сообщения не отправлено');
+    } catch (error) { toast(error.message, true); }
+    finally { state.pending = false; render(); }
+    return;
+  }
+  if (action === 'revoke-account' || action === 'forget-account') {
+    if (state.pending || state.accountLoading) return;
+    state.modal = { type: action === 'revoke-account' ? 'account-revoke' : 'account-forget', id }; render(); return;
+  }
+  if (action === 'confirm-revoke-account' || action === 'confirm-forget-account') {
+    if (state.pending || !state.modal) return;
+    const accountId = state.modal.id;
+    state.pending = true; render();
+    try {
+      if (action === 'confirm-revoke-account') await api(`/accounts/${encodeURIComponent(accountId)}`, { method: 'DELETE' });
+      else await api(`/accounts/${encodeURIComponent(accountId)}/forget`, { method: 'POST', body: JSON.stringify({ confirm: 'forget_without_revocation' }) });
+      state.modal = null;
+      state.selectedAccount = null; state.selectedAccountDialog = null; state.accountConversation = null;
+      state.accountDialogs = []; state.accountDialogsTruncated = false;
+      persistReplyAttempts(state.replyAttempts.filter(item => item.accountId !== String(accountId)));
+      await loadAll({ silent: true });
+      toast(action === 'confirm-revoke-account' ? 'Сессия отозвана в Telegram и удалена' : 'Локальная копия удалена; завершите сессию в Telegram вручную');
+    } catch (error) { toast(error.message, true); }
+    finally { state.pending = false; render(); }
+    return;
+  }
   if (action === 'new-campaign') { state.modal = { type: 'campaign' }; render(); return; }
   if (action === 'edit-campaign') { state.modal = { type: 'campaign', id: Number(id) }; render(); return; }
   if (action === 'schedule-campaign') {
@@ -475,7 +747,44 @@ root.addEventListener('submit', async event => {
   try {
     if (form.id === 'loginForm') {
       await api('/login', { method: 'POST', body: JSON.stringify({ password: values.password }) });
-      state.authGate = false; await loadAll(); toast('Добро пожаловать');
+      authVersion += 1;
+      state.authGate = false; state.replyAttempts = readReplyAttempts();
+      await loadAll();
+      if (!state.authGate) toast('Добро пожаловать');
+    } else if (form.id === 'accountImportForm') {
+      if (!canUseAccounts()) throw new Error('Подключение аккаунтов недоступно в демо');
+      const body = JSON.stringify({ session: values.session, label: values.label?.trim() || null });
+      form.elements.session.value = '';
+      values.session = '';
+      const result = await api('/accounts', { method: 'POST', body });
+      await loadAll({ silent: true });
+      toast('Аккаунт подключён; сессия не сохраняется в браузере');
+      await selectAccount(result.item.id);
+    } else if (form.id === 'accountReplyForm') {
+      if (!canUseAccounts() || !state.accountConversation?.can_send || replyAttemptFor(state.selectedAccount, state.selectedAccountDialog)) throw new Error('Отправка здесь недоступна');
+      const accountId = state.selectedAccount;
+      const dialogId = state.selectedAccountDialog;
+      if (!accountId || !dialogId || !values.body?.trim()) throw new Error('Выберите диалог и напишите ответ');
+      const requestId = crypto.randomUUID();
+      rememberReplyAttempt(accountId, dialogId, requestId);
+      try {
+        const result = await api(`/accounts/${encodeURIComponent(accountId)}/dialogs/${encodeURIComponent(dialogId)}/reply`, {
+          method: 'POST', body: JSON.stringify({ body: values.body.trim(), request_id: requestId }),
+        });
+        if (!Number.isSafeInteger(result.message?.id) || result.message.id < 1) throw new Error('Отправка не подтверждена; проверьте Telegram');
+      } catch (error) {
+        if ([400, 403, 404, 429].includes(error.status)) forgetReplyAttempt(accountId, dialogId, requestId);
+        else if (error.status !== 401) {
+          await selectAccountDialog(dialogId);
+          const attempt = replyAttemptFor(accountId, dialogId);
+          if (error.status === 409 && attempt?.status === 'missing') forgetReplyAttempt(accountId, dialogId, requestId);
+          if (attempt?.status === 'sent') return;
+        }
+        throw error;
+      }
+      forgetReplyAttempt(accountId, dialogId, requestId);
+      await selectAccountDialog(dialogId);
+      toast('Ответ отправлен');
     } else if (form.id === 'campaignForm') {
       const target = values.target_type || 'subscribers';
       if (target === 'chat' && !values.chat_id) throw new Error('Выберите канал или группу');
@@ -505,7 +814,11 @@ root.addEventListener('submit', async event => {
       await loadAll({ silent: true }); toast('Ответ отправлен');
     }
   } catch (error) { toast(error.message, true); }
-  finally { state.pending = false; if (submitter && submitter.isConnected) submitter.disabled = false; }
+  finally {
+    state.pending = false;
+    if (submitter?.isConnected) submitter.disabled = false;
+    else render();
+  }
 });
 
 root.addEventListener('input', event => {
@@ -540,13 +853,26 @@ window.addEventListener('hashchange', () => {
   render();
 });
 
+window.addEventListener('storage', event => {
+  if (event.key !== authLockKey || !event.newValue) return;
+  try { lockWorkspace({ signOut: JSON.parse(event.newValue).signOut === true }); }
+  catch { lockWorkspace(); }
+});
+
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) recheckAuthorization();
+});
+
 document.addEventListener('keydown', event => {
   if (event.key === 'Escape' && state.modal) { state.modal = null; render(); }
 });
 
 loadAll();
 setInterval(() => {
-  if (document.hidden || state.loading || state.authGate || state.modal || state.pending) return;
-  if (['INPUT', 'TEXTAREA', 'SELECT'].includes(document.activeElement?.tagName)) return;
+  if (document.hidden || state.loading || state.authGate) return;
+  if (state.route === 'accounts' || state.modal || state.pending || ['INPUT', 'TEXTAREA', 'SELECT'].includes(document.activeElement?.tagName)) {
+    recheckAuthorization();
+    return;
+  }
   loadAll({ silent: true });
 }, 30000);
