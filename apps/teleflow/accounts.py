@@ -16,6 +16,11 @@ MIN_SEND_INTERVAL = 5
 MAX_SENDS_PER_HOUR = 30
 MAX_SESSION_LENGTH = 8192
 MAX_MESSAGE_LENGTH = 4096
+ACCOUNT_HEALTH = ("ok", "restricted", "unauthorized")
+USERNAME_PATTERN = re.compile(r"[A-Za-z][A-Za-z0-9_]{4,31}")
+MAX_NAME_LENGTH = 64
+MAX_BIO_LENGTH = 140
+_KEEP = object()
 
 
 class AccountError(Exception):
@@ -77,6 +82,15 @@ class AccountManager:
                 """CREATE INDEX IF NOT EXISTS user_account_outbox_unresolved_idx
                    ON user_account_outbox(account_id, dialog_id, state, reviewed_at)"""
             )
+            account_columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(user_accounts)")
+            }
+            for column in ("health", "health_detail", "checked_at"):
+                if column not in account_columns:
+                    connection.execute(
+                        f"ALTER TABLE user_accounts ADD COLUMN {column} TEXT"
+                    )
             row = connection.execute(
                 "SELECT session_ciphertext FROM user_accounts LIMIT 1"
             ).fetchone()
@@ -123,19 +137,187 @@ class AccountManager:
 
     @staticmethod
     def _account(row: sqlite3.Row) -> dict[str, Any]:
+        health = row["health"] if row["health"] in ACCOUNT_HEALTH else "unknown"
         return {
             "id": str(row["id"]),
             "display_name": row["display_name"],
             "username": row["username"],
             "created_at": row["created_at"],
+            "health": health,
+            "health_detail": row["health_detail"],
+            "checked_at": row["checked_at"],
         }
 
     def list_accounts(self) -> list[dict[str, Any]]:
         with self._service._connection() as connection:
             rows = connection.execute(
-                "SELECT id, display_name, username, created_at FROM user_accounts ORDER BY created_at, id"
+                """SELECT id, display_name, username, created_at, health, health_detail,
+                          checked_at
+                   FROM user_accounts ORDER BY created_at, id"""
             ).fetchall()
         return [self._account(row) for row in rows]
+
+    def _account_by_id(self, account_id: int) -> dict[str, Any]:
+        with self._service._connection() as connection:
+            row = connection.execute(
+                """SELECT id, display_name, username, created_at, health, health_detail,
+                          checked_at
+                   FROM user_accounts WHERE id=?""",
+                (account_id,),
+            ).fetchone()
+        if row is None:
+            raise AccountError(404, "Account not found")
+        return self._account(row)
+
+    def _set_health(
+        self,
+        account_id: int,
+        health: str,
+        detail: str | None,
+        username: Any = _KEEP,
+    ) -> None:
+        assignments = "health=?, health_detail=?, checked_at=?"
+        params: list[Any] = [health, detail, self._service._now_iso()]
+        if username is not _KEEP:
+            assignments += ", username=?"
+            params.append(username)
+        with self._service._transaction() as connection:
+            connection.execute(
+                f"UPDATE user_accounts SET {assignments} WHERE id=?",
+                (*params, account_id),
+            )
+
+    def _note_unauthorized(self, account_id: int, error: AccountError) -> None:
+        # 409 from the gateway means Telegram no longer accepts this session.
+        if error.status == 409:
+            self._set_health(account_id, "unauthorized", error.message)
+
+    def check_account(self, account_id: int) -> dict[str, Any]:
+        account_id = self._id(account_id)
+        with self._lock(account_id):
+            session = self._session(account_id)
+            try:
+                profile, updated = self._gateway.check(account_id, session)
+            except AccountError as error:
+                if error.status != 409:
+                    raise
+                self._note_unauthorized(account_id, error)
+            else:
+                self._save_session(account_id, session, updated)
+                restricted = bool(profile.get("restricted"))
+                username = profile.get("username")
+                self._set_health(
+                    account_id,
+                    "restricted" if restricted else "ok",
+                    profile.get("restriction") if restricted else None,
+                    username
+                    if isinstance(username, str) and len(username) <= 64
+                    else None,
+                )
+            return self._account_by_id(account_id)
+
+    def rename_account(self, account_id: int, label: Any) -> dict[str, Any]:
+        account_id = self._id(account_id)
+        if not isinstance(label, str) or not label.strip() or len(label.strip()) > 80:
+            raise AccountError(400, "Account label must be 1-80 characters")
+        with self._lock(account_id), self._service._transaction() as connection:
+            if not connection.execute(
+                "UPDATE user_accounts SET display_name=? WHERE id=?",
+                (label.strip(), account_id),
+            ).rowcount:
+                raise AccountError(404, "Account not found")
+        return self._account_by_id(account_id)
+
+    def _validate_profile(self, data: dict[str, Any]) -> tuple[str, str, str, str]:
+        allowed = {"first_name", "last_name", "username", "about"}
+        if set(data) - allowed:
+            raise AccountError(
+                400, "Profile accepts first_name, last_name, username and about"
+            )
+        first_name = data.get("first_name")
+        if (
+            not isinstance(first_name, str)
+            or not first_name.strip()
+            or len(first_name.strip()) > MAX_NAME_LENGTH
+        ):
+            raise AccountError(400, "first_name must contain 1-64 characters")
+        last_name = data.get("last_name")
+        if last_name is None:
+            last_name = ""
+        if not isinstance(last_name, str) or len(last_name.strip()) > MAX_NAME_LENGTH:
+            raise AccountError(400, "last_name must be at most 64 characters")
+        username = data.get("username")
+        if username is None:
+            username = ""
+        if not isinstance(username, str):
+            raise AccountError(400, "username must be text")
+        username = username.strip().lstrip("@")
+        if username and not USERNAME_PATTERN.fullmatch(username):
+            raise AccountError(
+                400,
+                "username must be 5-32 latin letters, digits or underscores, "
+                "starting with a letter",
+            )
+        about = data.get("about")
+        if about is None:
+            about = ""
+        if not isinstance(about, str) or len(about.strip()) > MAX_BIO_LENGTH:
+            raise AccountError(
+                400, f"about must be at most {MAX_BIO_LENGTH} characters"
+            )
+        return (
+            first_name.strip(),
+            last_name.strip(),
+            username,
+            about.strip(),
+        )
+
+    def _store_username(self, account_id: int, username: str | None) -> None:
+        with self._service._transaction() as connection:
+            connection.execute(
+                "UPDATE user_accounts SET username=? WHERE id=?",
+                (username, account_id),
+            )
+
+    def get_profile(self, account_id: int) -> dict[str, Any]:
+        account_id = self._id(account_id)
+        with self._lock(account_id):
+            session = self._session(account_id)
+            try:
+                profile, updated = self._gateway.profile(account_id, session)
+            except AccountError as error:
+                self._note_unauthorized(account_id, error)
+                raise
+            self._save_session(account_id, session, updated)
+            return profile
+
+    def save_profile(self, account_id: int, data: Any) -> dict[str, Any]:
+        account_id = self._id(account_id)
+        if not isinstance(data, dict):
+            raise AccountError(400, "Profile must be a JSON object")
+        first_name, last_name, username, about = self._validate_profile(data)
+        with self._lock(account_id):
+            session = self._session(account_id)
+            try:
+                profile, updated = self._gateway.update_profile(
+                    account_id, session, first_name, last_name, username, about
+                )
+            except AccountError as error:
+                self._note_unauthorized(account_id, error)
+                raise
+            self._save_session(account_id, session, updated)
+            self._store_username(account_id, profile.get("username") or None)
+            return profile
+
+    def prune_outbox(self, before: dt.datetime) -> int:
+        cutoff = before.astimezone(dt.timezone.utc).replace(microsecond=0)
+        with self._service._transaction() as connection:
+            return connection.execute(
+                """DELETE FROM user_account_outbox WHERE created_at<?
+                   AND (state IN ('sent', 'rejected')
+                        OR (state='unknown' AND reviewed_at IS NOT NULL))""",
+                (cutoff.isoformat().replace("+00:00", "Z"),),
+            ).rowcount
 
     def _session(self, account_id: int) -> str:
         with self._service._connection() as connection:
@@ -181,6 +363,8 @@ class AccountManager:
         username = profile.get("username")
         if not isinstance(username, str) or len(username) > 64:
             username = None
+        restricted = bool(profile.get("restricted"))
+        detail = profile.get("restriction") if restricted else None
         with self._lock(account_id):
             with self._service._transaction() as connection:
                 if connection.execute(
@@ -189,23 +373,31 @@ class AccountManager:
                     raise AccountError(409, "This account is already connected")
                 connection.execute(
                     """INSERT INTO user_accounts
-                       (id, display_name, username, session_ciphertext, created_at)
-                       VALUES (?, ?, ?, ?, ?)""",
+                       (id, display_name, username, session_ciphertext, created_at,
+                        health, health_detail, checked_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         account_id,
                         name,
                         username,
                         self._cipher.encrypt(updated_session.encode("ascii")),
                         self._service._now_iso(),
+                        "restricted" if restricted else "ok",
+                        detail if isinstance(detail, str) else None,
+                        self._service._now_iso(),
                     ),
                 )
-        return {"id": str(account_id), "display_name": name, "username": username}
+        return self._account_by_id(account_id)
 
     def list_dialogs(self, account_id: int) -> dict[str, Any]:
         account_id = self._id(account_id)
         with self._lock(account_id):
             session = self._session(account_id)
-            result, updated = self._gateway.dialogs(account_id, session)
+            try:
+                result, updated = self._gateway.dialogs(account_id, session)
+            except AccountError as error:
+                self._note_unauthorized(account_id, error)
+                raise
             self._save_session(account_id, session, updated)
             return result
 
@@ -214,7 +406,13 @@ class AccountManager:
         dialog_id = self._dialog_id(dialog_id)
         with self._lock(account_id):
             session = self._session(account_id)
-            result, updated = self._gateway.conversation(account_id, session, dialog_id)
+            try:
+                result, updated = self._gateway.conversation(
+                    account_id, session, dialog_id
+                )
+            except AccountError as error:
+                self._note_unauthorized(account_id, error)
+                raise
             self._save_session(account_id, session, updated)
             with self._service._connection() as connection:
                 unresolved = connection.execute(
@@ -378,11 +576,12 @@ class AccountManager:
                 )
             except AccountError as error:
                 with self._service._transaction() as connection:
+                    # The gateway raises 409 only before sending, so it is a safe rejection.
                     connection.execute(
                         "UPDATE user_account_outbox SET state=? WHERE request_id=?",
                         (
                             "rejected"
-                            if error.status in {400, 403, 404, 429}
+                            if error.status in {400, 403, 404, 409, 429}
                             else "unknown",
                             request_id,
                         ),
@@ -405,6 +604,7 @@ class AccountManager:
                                 account_id,
                             ),
                         )
+                self._note_unauthorized(account_id, error)
                 raise
             except Exception:
                 with self._service._transaction() as connection:

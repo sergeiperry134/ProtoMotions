@@ -5,12 +5,15 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import datetime as dt
 import http.cookies
 import http.server
+import io
 import ipaddress
 import json
 import logging
+import math
 import mimetypes
 import os
 import re
@@ -46,7 +49,19 @@ MAX_BODY_BYTES = 64 * 1024
 MAX_CAMPAIGN_BODY = 4096
 SESSION_COOKIE = "teleflow_session"
 SESSION_TTL_SECONDS = 12 * 60 * 60
+LOGIN_FAILURE_WINDOW_SECONDS = 600
+MAX_LOGIN_FAILURES = 5
+LOGIN_LOCKOUT_SECONDS = 900
 MAX_DELIVERY_ATTEMPTS = 8
+MAX_SEQUENCE_STEPS = 10
+MAX_SEQUENCE_DELAY_MINUTES = 30 * 24 * 60
+PROCESSED_UPDATE_RETENTION_DAYS = 7
+ACCOUNT_OUTBOX_RETENTION_DAYS = 30
+MAINTENANCE_INTERVAL_SECONDS = 60 * 60
+PLACEHOLDER_PATTERN = re.compile(r"\{(first_name|username)\}")
+# Telegram caps first names at 64 and usernames at 32 characters.
+PLACEHOLDER_LIMITS = {"first_name": 64, "username": 32}
+DELIVERY_STATUSES = ("queued", "sending", "sent", "failed", "skipped")
 LOG = logging.getLogger("teleflow")
 
 
@@ -64,6 +79,28 @@ def iso_utc(value: dt.datetime | None = None) -> str:
         .isoformat()
         .replace("+00:00", "Z")
     )
+
+
+def placeholder_worst_case_length(body: str) -> int:
+    return len(body) + sum(
+        PLACEHOLDER_LIMITS[match.group(1)] - len(match.group(0))
+        for match in PLACEHOLDER_PATTERN.finditer(body)
+    )
+
+
+def render_placeholders(body: str, first_name: str | None, username: str | None) -> str:
+    values = {
+        "first_name": (first_name or "")[: PLACEHOLDER_LIMITS["first_name"]],
+        "username": (username or "")[: PLACEHOLDER_LIMITS["username"]],
+    }
+    # One regex pass, so a name that itself looks like a placeholder stays literal.
+    return PLACEHOLDER_PATTERN.sub(lambda match: values[match.group(1)], body)
+
+
+def csv_cell(value: Any) -> str:
+    text = "" if value is None else str(value)
+    # Spreadsheets evaluate cells starting with these characters as formulas.
+    return "'" + text if text[:1] in {"=", "+", "-", "@", "\t", "\r"} else text
 
 
 class DatabaseInUseError(RuntimeError):
@@ -389,6 +426,9 @@ class TeleflowService:
         self._bot_id: int | None = None
         self._sessions: dict[str, float] = {}
         self._sessions_lock = threading.Lock()
+        self._login_lock = threading.Lock()
+        self._login_failures: dict[str, list[dt.datetime]] = {}
+        self._login_locks: dict[str, dt.datetime] = {}
         self._database_lock_fd: int | None = None
         self._database_lock_path = self.db_path.with_name(self.db_path.name + ".lock")
         if account_configured:
@@ -580,6 +620,23 @@ class TeleflowService:
                     created_at TEXT NOT NULL,
                     error TEXT
                 );
+                CREATE TABLE IF NOT EXISTS sequence_steps (
+                    position INTEGER PRIMARY KEY,
+                    delay_minutes INTEGER NOT NULL CHECK (delay_minutes BETWEEN 0 AND 43200),
+                    body TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS sequence_runs (
+                    chat_id INTEGER PRIMARY KEY REFERENCES subscribers(chat_id) ON DELETE CASCADE,
+                    step_index INTEGER NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL CHECK (status IN ('active', 'sending', 'completed', 'stopped', 'failed')),
+                    next_at TEXT,
+                    attempt_count INTEGER NOT NULL DEFAULT 0,
+                    error TEXT,
+                    started_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS sequence_runs_due_idx
+                    ON sequence_runs(status, next_at);
                 """
             )
             delivery_columns = {
@@ -617,6 +674,9 @@ class TeleflowService:
             )
             connection.execute(
                 "UPDATE reply_queue SET status = 'pending' WHERE status = 'sending'"
+            )
+            connection.execute(
+                "UPDATE sequence_runs SET status = 'active' WHERE status = 'sending'"
             )
 
     def _ensure_telegram(self, force: bool = False) -> dict[str, Any]:
@@ -691,6 +751,21 @@ class TeleflowService:
         if len(text) > max_length:
             raise APIError(400, f"{field} must be at most {max_length} characters")
         return text
+
+    @staticmethod
+    def _check_placeholders(body: str, *, allowed: bool) -> None:
+        if not PLACEHOLDER_PATTERN.search(body):
+            return
+        if not allowed:
+            raise APIError(400, "Placeholders are only available for bot subscribers")
+        if not PLACEHOLDER_PATTERN.sub("", body).strip():
+            # A subscriber without that value would receive empty text.
+            raise APIError(400, "Message needs text besides placeholders")
+        if placeholder_worst_case_length(body) > MAX_CAMPAIGN_BODY:
+            raise APIError(
+                400,
+                f"With placeholders the message may exceed {MAX_CAMPAIGN_BODY} characters",
+            )
 
     def _verify_chat(self, supplied_id: Any) -> dict[str, str]:
         chat_ref = self._required_text(supplied_id, "chat_id", 64)
@@ -855,6 +930,7 @@ class TeleflowService:
         )
         if target_type not in {"subscribers", "chat"}:
             raise APIError(400, "target_type must be 'subscribers' or 'chat'")
+        self._check_placeholders(body, allowed=target_type == "subscribers")
         supplied_chat = data.get("chat_id", existing["chat_id"] if existing else None)
         if target_type == "chat":
             chat_id = self._require_saved_chat(supplied_chat)
@@ -988,12 +1064,29 @@ class TeleflowService:
                 """UPDATE campaign_deliveries
                    SET status='queued', attempt_count=0, next_attempt_at=NULL,
                        error=NULL, failed_at=NULL
-                   WHERE campaign_id=? AND status='failed'""",
+                   WHERE campaign_id=? AND status='failed'
+                     AND chat_id NOT LIKE 'erased:%'""",
                 (campaign_id,),
             ).rowcount
             if not retried:
                 raise APIError(409, "This campaign has no failed deliveries to retry")
             self._update_campaign_counts(connection, campaign_id)
+            return self._campaign(campaign_id, connection)
+
+    def cancel_campaign_schedule(self, campaign_id: int) -> dict[str, Any]:
+        with self._transaction() as connection:
+            cursor = connection.execute(
+                """UPDATE campaigns SET status='draft', scheduled_at=NULL
+                   WHERE id=? AND status='scheduled'""",
+                (campaign_id,),
+            )
+            if not cursor.rowcount:
+                exists = connection.execute(
+                    "SELECT 1 FROM campaigns WHERE id=?", (campaign_id,)
+                ).fetchone()
+                if exists is None:
+                    raise APIError(404, "Campaign not found")
+                raise APIError(409, "Only scheduled campaigns can be cancelled")
             return self._campaign(campaign_id, connection)
 
     def _activate_campaign(
@@ -1182,16 +1275,17 @@ class TeleflowService:
 
     def _finish_skipped_delivery(self, delivery: dict[str, Any]) -> None:
         with self._transaction() as connection:
-            connection.execute(
+            skipped = connection.execute(
                 """UPDATE campaign_deliveries
                    SET status='skipped', next_attempt_at=NULL
                    WHERE id=? AND status='sending'""",
                 (delivery["id"],),
-            )
-            connection.execute(
-                "UPDATE campaigns SET recipient_count=MAX(0, recipient_count-1) WHERE id=?",
-                (delivery["campaign_id"],),
-            )
+            ).rowcount
+            if skipped:
+                connection.execute(
+                    "UPDATE campaigns SET recipient_count=MAX(0, recipient_count-1) WHERE id=?",
+                    (delivery["campaign_id"],),
+                )
             self._update_campaign_counts(connection, delivery["campaign_id"])
 
     def _send_message(self, chat_id: int | str, body: str) -> dict[str, Any]:
@@ -1226,6 +1320,7 @@ class TeleflowService:
 
     def _deliver_campaign_delivery(self, delivery: dict[str, Any]) -> bool:
         with self._consent_lock:
+            body = delivery["body"]
             if delivery["target_type"] == "subscribers":
                 try:
                     subscriber_id = int(delivery["chat_id"])
@@ -1233,14 +1328,15 @@ class TeleflowService:
                     subscriber_id = -1
                 with self._connection() as connection:
                     opted = connection.execute(
-                        "SELECT opted_in FROM subscribers WHERE chat_id=?",
+                        "SELECT opted_in, first_name, username FROM subscribers WHERE chat_id=?",
                         (subscriber_id,),
                     ).fetchone()
                 if opted is None or not opted["opted_in"]:
                     self._finish_skipped_delivery(delivery)
                     return False
+                body = render_placeholders(body, opted["first_name"], opted["username"])
             try:
-                result = self._send_message(delivery["chat_id"], delivery["body"])
+                result = self._send_message(delivery["chat_id"], body)
             except Exception as error:
                 detail = (
                     error.message
@@ -1287,7 +1383,7 @@ class TeleflowService:
                            VALUES (?, 'out', ?, ?, ?)""",
                         (
                             delivery["chat_id"],
-                            delivery["body"],
+                            body,
                             sent_at,
                             message_id,
                         ),
@@ -1410,11 +1506,267 @@ class TeleflowService:
                 delivered += 1
         return delivered
 
+    def _sequence_enabled(self, connection: sqlite3.Connection) -> bool:
+        row = connection.execute(
+            "SELECT value FROM settings WHERE key='sequence_enabled'"
+        ).fetchone()
+        return bool(row and row["value"] == "1")
+
+    def _enroll_sequence(self, connection: sqlite3.Connection, chat_id: int) -> None:
+        if not self._sequence_enabled(connection):
+            return
+        first = connection.execute(
+            "SELECT delay_minutes FROM sequence_steps WHERE position=0"
+        ).fetchone()
+        if first is None:
+            return
+        now = self._now()
+        # Re-running /start restarts only a stopped or failed funnel, never a live one.
+        connection.execute(
+            """INSERT INTO sequence_runs
+               (chat_id, step_index, status, next_at, attempt_count, error, started_at, updated_at)
+               VALUES (?, 0, 'active', ?, 0, NULL, ?, ?)
+               ON CONFLICT(chat_id) DO UPDATE SET step_index=0, status='active',
+                 next_at=excluded.next_at, attempt_count=0, error=NULL,
+                 started_at=excluded.started_at, updated_at=excluded.updated_at
+               WHERE sequence_runs.status IN ('stopped', 'failed')""",
+            (
+                chat_id,
+                iso_utc(now + dt.timedelta(minutes=int(first["delay_minutes"]))),
+                iso_utc(now),
+                iso_utc(now),
+            ),
+        )
+
+    def _stop_sequence(self, connection: sqlite3.Connection, chat_id: int) -> None:
+        connection.execute(
+            """UPDATE sequence_runs SET status='stopped', next_at=NULL, updated_at=?
+               WHERE chat_id=? AND status IN ('active', 'sending')""",
+            (self._now_iso(), chat_id),
+        )
+
+    def _claim_sequence_run(self) -> dict[str, Any] | None:
+        with self._transaction() as connection:
+            if not self._sequence_enabled(connection):
+                return None
+            row = connection.execute(
+                """SELECT chat_id, step_index, attempt_count FROM sequence_runs
+                   WHERE status='active' AND next_at IS NOT NULL AND next_at<=?
+                   ORDER BY next_at, chat_id LIMIT 1""",
+                (self._now_iso(),),
+            ).fetchone()
+            if row is None:
+                return None
+            connection.execute(
+                """UPDATE sequence_runs
+                   SET status='sending', attempt_count=attempt_count+1, updated_at=?
+                   WHERE chat_id=? AND status='active'""",
+                (self._now_iso(), row["chat_id"]),
+            )
+            run = dict(row)
+            run["attempt_count"] = int(row["attempt_count"]) + 1
+            return run
+
+    def _deliver_sequence_run(self, run: dict[str, Any]) -> bool:
+        chat_id = int(run["chat_id"])
+        step_index = int(run["step_index"])
+        with self._consent_lock:
+            with self._connection() as connection:
+                current = connection.execute(
+                    "SELECT status, step_index FROM sequence_runs WHERE chat_id=?",
+                    (chat_id,),
+                ).fetchone()
+                subscriber = connection.execute(
+                    "SELECT opted_in, first_name, username FROM subscribers WHERE chat_id=?",
+                    (chat_id,),
+                ).fetchone()
+                step = connection.execute(
+                    "SELECT body FROM sequence_steps WHERE position=?", (step_index,)
+                ).fetchone()
+            # /stop then /start (or an erase) may have reset this run since it was claimed.
+            if (
+                current is None
+                or current["status"] != "sending"
+                or int(current["step_index"]) != step_index
+            ):
+                return False
+            consenting = subscriber is not None and bool(subscriber["opted_in"])
+            if not consenting or step is None:
+                with self._transaction() as connection:
+                    connection.execute(
+                        """UPDATE sequence_runs SET status=?, next_at=NULL, updated_at=?
+                           WHERE chat_id=? AND status='sending'""",
+                        (
+                            "completed" if consenting else "stopped",
+                            self._now_iso(),
+                            chat_id,
+                        ),
+                    )
+                return False
+            body = render_placeholders(
+                step["body"], subscriber["first_name"], subscriber["username"]
+            )
+            try:
+                result = self._send_message(chat_id, body)
+            except Exception as error:
+                detail = (
+                    error.message
+                    if isinstance(error, TelegramError)
+                    else "Telegram delivery failed"
+                )
+                retry_at = self._retry_at(error, int(run["attempt_count"]))
+                with self._transaction() as connection:
+                    connection.execute(
+                        """UPDATE sequence_runs SET status=?, next_at=?, error=?, updated_at=?
+                           WHERE chat_id=? AND status='sending'""",
+                        (
+                            "active" if retry_at else "failed",
+                            retry_at,
+                            detail[:300],
+                            self._now_iso(),
+                            chat_id,
+                        ),
+                    )
+                return False
+
+            message_id = (
+                result.get("message_id")
+                if isinstance(result.get("message_id"), int)
+                else None
+            )
+            now = self._now()
+            with self._transaction() as connection:
+                following = connection.execute(
+                    "SELECT delay_minutes FROM sequence_steps WHERE position=?",
+                    (step_index + 1,),
+                ).fetchone()
+                next_at = (
+                    iso_utc(now + dt.timedelta(minutes=int(following["delay_minutes"])))
+                    if following
+                    else None
+                )
+                connection.execute(
+                    """UPDATE sequence_runs
+                       SET status=?, step_index=?, next_at=?, attempt_count=0,
+                           error=NULL, updated_at=?
+                       WHERE chat_id=? AND status='sending'""",
+                    (
+                        "active" if following else "completed",
+                        step_index + 1,
+                        next_at,
+                        iso_utc(now),
+                        chat_id,
+                    ),
+                )
+                connection.execute(
+                    """INSERT INTO messages
+                       (chat_id, direction, body, created_at, telegram_message_id)
+                       VALUES (?, 'out', ?, ?, ?)""",
+                    (str(chat_id), body, iso_utc(now), message_id),
+                )
+            return True
+
+    def _deliver_sequences(self, limit: int = 100) -> int:
+        if self.demo or not self._ensure_telegram()["connected"]:
+            return 0
+        delivered = 0
+        for _ in range(max(1, limit)):
+            run = self._claim_sequence_run()
+            if run is None:
+                break
+            if self._deliver_sequence_run(run):
+                delivered += 1
+        return delivered
+
+    def get_sequence(self) -> dict[str, Any]:
+        with self._connection() as connection:
+            enabled = self._sequence_enabled(connection)
+            steps = connection.execute(
+                "SELECT delay_minutes, body FROM sequence_steps ORDER BY position"
+            ).fetchall()
+            counts = {
+                row["status"]: int(row["total"])
+                for row in connection.execute(
+                    "SELECT status, COUNT(*) AS total FROM sequence_runs GROUP BY status"
+                )
+            }
+        return {
+            "enabled": enabled,
+            "steps": [
+                {"delay_minutes": int(row["delay_minutes"]), "body": row["body"]}
+                for row in steps
+            ],
+            "stats": {
+                "active": counts.get("active", 0) + counts.get("sending", 0),
+                "completed": counts.get("completed", 0),
+                "stopped": counts.get("stopped", 0),
+                "failed": counts.get("failed", 0),
+            },
+        }
+
+    def save_sequence(self, data: dict[str, Any]) -> dict[str, Any]:
+        # Both keys are required so a partial "pause" payload can never wipe the steps.
+        if set(data) != {"enabled", "steps"}:
+            raise APIError(400, "Sequence needs exactly enabled and steps")
+        enabled = data["enabled"]
+        steps = data["steps"]
+        if not isinstance(enabled, bool):
+            raise APIError(400, "enabled must be a boolean")
+        if not isinstance(steps, list) or len(steps) > MAX_SEQUENCE_STEPS:
+            raise APIError(
+                400, f"steps must be a list of at most {MAX_SEQUENCE_STEPS} items"
+            )
+        normalized = []
+        for index, step in enumerate(steps, start=1):
+            if not isinstance(step, dict) or set(step) != {"delay_minutes", "body"}:
+                raise APIError(400, f"Step {index} needs delay_minutes and body")
+            delay = step["delay_minutes"]
+            if (
+                isinstance(delay, bool)
+                or not isinstance(delay, int)
+                or not 0 <= delay <= MAX_SEQUENCE_DELAY_MINUTES
+            ):
+                raise APIError(
+                    400,
+                    f"Step {index} delay must be 0-{MAX_SEQUENCE_DELAY_MINUTES} minutes",
+                )
+            body = self._required_text(
+                step["body"], f"Step {index} body", MAX_CAMPAIGN_BODY, preserve=True
+            )
+            self._check_placeholders(body, allowed=True)
+            normalized.append((delay, body))
+        if enabled and not normalized:
+            raise APIError(400, "Add at least one step before enabling the sequence")
+        with self._transaction() as connection:
+            connection.execute("DELETE FROM sequence_steps")
+            connection.executemany(
+                "INSERT INTO sequence_steps(position, delay_minutes, body) VALUES (?, ?, ?)",
+                [
+                    (position, delay, body)
+                    for position, (delay, body) in enumerate(normalized)
+                ],
+            )
+            connection.execute(
+                """INSERT INTO settings(key, value) VALUES ('sequence_enabled', ?)
+                   ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+                ("1" if enabled else "0",),
+            )
+            connection.execute(
+                """UPDATE sequence_runs SET status='completed', next_at=NULL, updated_at=?
+                   WHERE status='active' AND step_index>=?""",
+                (self._now_iso(), len(normalized)),
+            )
+        return self.get_sequence()
+
     def dispatch_pending(self, limit: int = 100) -> int:
         if self.demo or not self._ensure_telegram()["connected"]:
             return 0
         self._activate_due_campaigns()
-        return self._deliver_replies(limit) + self._deliver_campaigns(limit)
+        return (
+            self._deliver_replies(limit)
+            + self._deliver_sequences(limit)
+            + self._deliver_campaigns(limit)
+        )
 
     def _read_offset(self, connection: sqlite3.Connection) -> int:
         row = connection.execute(
@@ -1525,6 +1877,10 @@ class TeleflowService:
                 "INSERT INTO messages(chat_id, direction, body, created_at) VALUES (?, 'in', ?, ?)",
                 (str(sender_id), text[:MAX_BODY_BYTES], created_at),
             )
+            if command == "/start":
+                self._enroll_sequence(connection, sender_id)
+            elif command == "/stop":
+                self._stop_sequence(connection, sender_id)
             if command in {"/start", "/stop"} or not isinstance(raw_text, str):
                 return True
             subscriber = connection.execute(
@@ -1593,6 +1949,175 @@ class TeleflowService:
             }
             for row in rows
         ]
+
+    def opt_out_subscriber(self, chat_id: int) -> dict[str, Any]:
+        # Same lock as sends: no delivery can pass its consent check mid-opt-out.
+        with self._consent_lock, self._transaction() as connection:
+            cursor = connection.execute(
+                "UPDATE subscribers SET opted_in=0 WHERE chat_id=?", (chat_id,)
+            )
+            if not cursor.rowcount:
+                raise APIError(404, "Subscriber not found")
+            connection.execute(
+                """UPDATE reply_queue SET status='cancelled'
+                   WHERE chat_id=? AND status='pending'""",
+                (chat_id,),
+            )
+            self._stop_sequence(connection, chat_id)
+            row = connection.execute(
+                """SELECT chat_id, first_name, username, opted_in, joined_at
+                   FROM subscribers WHERE chat_id=?""",
+                (chat_id,),
+            ).fetchone()
+            return {
+                "chat_id": int(row["chat_id"]),
+                "first_name": row["first_name"],
+                "username": row["username"],
+                "opted_in": bool(row["opted_in"]),
+                "joined_at": row["joined_at"],
+            }
+
+    def erase_subscriber(self, chat_id: int) -> None:
+        with self._consent_lock, self._transaction() as connection:
+            if (
+                connection.execute(
+                    "SELECT 1 FROM subscribers WHERE chat_id=?", (chat_id,)
+                ).fetchone()
+                is None
+            ):
+                raise APIError(404, "Subscriber not found")
+            key = str(chat_id)
+            queued = connection.execute(
+                """SELECT campaign_id, COUNT(*) AS total FROM campaign_deliveries
+                   WHERE chat_id=? AND status='queued' GROUP BY campaign_id""",
+                (key,),
+            ).fetchall()
+            connection.execute(
+                """UPDATE campaign_deliveries SET status='skipped', next_attempt_at=NULL
+                   WHERE chat_id=? AND status='queued'""",
+                (key,),
+            )
+            for row in queued:
+                connection.execute(
+                    "UPDATE campaigns SET recipient_count=MAX(0, recipient_count-?) WHERE id=?",
+                    (int(row["total"]), row["campaign_id"]),
+                )
+                self._update_campaign_counts(connection, row["campaign_id"])
+            # Keep delivery rows so campaign totals stay intact, but drop the identity.
+            connection.execute(
+                """UPDATE campaign_deliveries SET chat_id='erased:' || id, error=NULL
+                   WHERE chat_id=?""",
+                (key,),
+            )
+            connection.execute("DELETE FROM messages WHERE chat_id=?", (key,))
+            connection.execute("DELETE FROM reply_queue WHERE chat_id=?", (chat_id,))
+            connection.execute("DELETE FROM sequence_runs WHERE chat_id=?", (chat_id,))
+            connection.execute("DELETE FROM subscribers WHERE chat_id=?", (chat_id,))
+
+    def export_subscribers_csv(self) -> bytes:
+        with self._connection() as connection:
+            rows = connection.execute(
+                """SELECT chat_id, first_name, username, opted_in, joined_at
+                   FROM subscribers ORDER BY joined_at, chat_id"""
+            ).fetchall()
+        buffer = io.StringIO()
+        writer = csv.writer(buffer, lineterminator="\r\n")
+        writer.writerow(["chat_id", "first_name", "username", "status", "joined_at"])
+        for row in rows:
+            writer.writerow(
+                [
+                    int(row["chat_id"]),
+                    csv_cell(row["first_name"]),
+                    csv_cell(row["username"]),
+                    "subscribed" if row["opted_in"] else "unsubscribed",
+                    csv_cell(row["joined_at"]),
+                ]
+            )
+        # The BOM lets spreadsheet apps detect UTF-8 for Cyrillic names.
+        return ("\ufeff" + buffer.getvalue()).encode("utf-8")
+
+    def campaign_deliveries(
+        self,
+        campaign_id: int,
+        status: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        if status is not None and status not in DELIVERY_STATUSES:
+            raise APIError(400, "Unknown delivery status filter")
+        if not 1 <= limit <= 200 or offset < 0:
+            raise APIError(400, "limit must be 1-200 and offset non-negative")
+        with self._connection() as connection:
+            self._campaign(campaign_id, connection)
+            counts = {name: 0 for name in DELIVERY_STATUSES}
+            for row in connection.execute(
+                """SELECT status, COUNT(*) AS total FROM campaign_deliveries
+                   WHERE campaign_id=? GROUP BY status""",
+                (campaign_id,),
+            ):
+                counts[row["status"]] = int(row["total"])
+            filters = "d.campaign_id=?"
+            params: list[Any] = [campaign_id]
+            if status is not None:
+                filters += " AND d.status=?"
+                params.append(status)
+            rows = connection.execute(
+                f"""SELECT d.chat_id, d.status, d.attempt_count, d.error, d.sent_at,
+                          d.failed_at, d.next_attempt_at, s.first_name, s.username,
+                          c.title AS chat_title
+                   FROM campaign_deliveries d
+                   LEFT JOIN subscribers s ON s.chat_id=CAST(d.chat_id AS INTEGER)
+                   LEFT JOIN chats c ON c.chat_id=d.chat_id
+                   WHERE {filters}
+                   ORDER BY CASE d.status WHEN 'failed' THEN 0
+                     WHEN 'queued' THEN 1 WHEN 'sending' THEN 1 ELSE 2 END, d.id
+                   LIMIT ? OFFSET ?""",
+                (*params, limit, offset),
+            ).fetchall()
+        erased = [row["chat_id"].startswith("erased:") for row in rows]
+        return {
+            "campaign_id": campaign_id,
+            "counts": counts,
+            "total": counts[status] if status else sum(counts.values()),
+            "items": [
+                {
+                    "chat_id": None if is_erased else row["chat_id"],
+                    "name": None
+                    if is_erased
+                    else row["chat_title"] or row["first_name"] or None,
+                    "username": None if is_erased else row["username"],
+                    "erased": is_erased,
+                    "status": row["status"],
+                    "attempt_count": int(row["attempt_count"] or 0),
+                    "error": row["error"],
+                    "sent_at": row["sent_at"],
+                    "failed_at": row["failed_at"],
+                    "next_attempt_at": row["next_attempt_at"],
+                }
+                for row, is_erased in zip(rows, erased)
+            ],
+        }
+
+    def prune_history(self) -> dict[str, int]:
+        now = self._now()
+        cutoff = iso_utc(now - dt.timedelta(days=PROCESSED_UPDATE_RETENTION_DAYS))
+        with self._transaction() as connection:
+            # Terminal keyword replies cascade with their update; pending ones pin it.
+            updates = connection.execute(
+                """DELETE FROM processed_updates WHERE processed_at<?
+                   AND update_id NOT IN (
+                     SELECT update_id FROM reply_queue
+                     WHERE status IN ('pending', 'sending'))""",
+                (cutoff,),
+            ).rowcount
+        outbox = (
+            self.accounts.prune_outbox(
+                now - dt.timedelta(days=ACCOUNT_OUTBOX_RETENTION_DAYS)
+            )
+            if self.accounts is not None
+            else 0
+        )
+        return {"processed_updates": updates, "account_outbox": outbox}
 
     def list_inbox(self) -> list[dict[str, Any]]:
         with self._connection() as connection:
@@ -1847,12 +2372,53 @@ class TeleflowService:
             with self._sessions_lock:
                 self._sessions.pop(token, None)
 
+    def login_retry_after(self, peer: str) -> int | None:
+        with self._login_lock:
+            now = self._now()
+            locked_until = self._login_locks.get(peer)
+            if locked_until is not None and locked_until > now:
+                return math.ceil((locked_until - now).total_seconds())
+            self._login_locks.pop(peer, None)
+            window = dt.timedelta(seconds=LOGIN_FAILURE_WINDOW_SECONDS)
+            failures = [
+                stamp
+                for stamp in self._login_failures.get(peer, [])
+                if now - stamp < window
+            ]
+            if failures:
+                self._login_failures[peer] = failures
+            else:
+                self._login_failures.pop(peer, None)
+            return None
+
+    def record_login_failure(self, peer: str) -> None:
+        with self._login_lock:
+            now = self._now()
+            window = dt.timedelta(seconds=LOGIN_FAILURE_WINDOW_SECONDS)
+            failures = [
+                stamp
+                for stamp in self._login_failures.get(peer, [])
+                if now - stamp < window
+            ]
+            failures.append(now)
+            self._login_failures[peer] = failures
+            if len(failures) >= MAX_LOGIN_FAILURES:
+                self._login_locks[peer] = now + dt.timedelta(
+                    seconds=LOGIN_LOCKOUT_SECONDS
+                )
+
+    def record_login_success(self, peer: str) -> None:
+        with self._login_lock:
+            self._login_failures.pop(peer, None)
+            self._login_locks.pop(peer, None)
+
 
 class BackgroundWorker:
     def __init__(self, service: TeleflowService, interval: float = 2.0):
         self.service = service
         self.interval = max(0.25, interval)
         self._stop = threading.Event()
+        self._next_maintenance = 0.0
         self._thread = threading.Thread(
             target=self._run, name="teleflow-worker", daemon=True
         )
@@ -1883,6 +2449,12 @@ class BackgroundWorker:
                     LOG.warning("Background dispatch failed: %s", error.message[:160])
                 except Exception as error:
                     LOG.warning("Background dispatch failed (%s)", type(error).__name__)
+            if time.monotonic() >= self._next_maintenance:
+                self._next_maintenance = time.monotonic() + MAINTENANCE_INTERVAL_SECONDS
+                try:
+                    self.service.prune_history()
+                except Exception as error:
+                    LOG.warning("History pruning failed (%s)", type(error).__name__)
             self._stop.wait(self.interval)
 
 
@@ -2156,6 +2728,48 @@ class TeleflowRequestHandler(http.server.BaseHTTPRequestHandler):
         if not head_only:
             self.wfile.write(body)
 
+    def _send_bytes(
+        self,
+        status: int,
+        body: bytes,
+        content_type: str,
+        extra_headers: list[tuple[str, str]] | None = None,
+    ) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "same-origin")
+        self.send_header("X-Frame-Options", "SAMEORIGIN")
+        for key, value in extra_headers or []:
+            self.send_header(key, value)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _query_params(self) -> dict[str, str]:
+        try:
+            params = urllib.parse.parse_qs(
+                urllib.parse.urlsplit(self.path).query,
+                keep_blank_values=True,
+                strict_parsing=False,
+                max_num_fields=20,
+            )
+        except ValueError:
+            raise APIError(400, "Too many query parameters") from None
+        if any(len(values) > 1 for values in params.values()):
+            raise APIError(400, "Duplicate query parameter")
+        return {key: values[0] for key, values in params.items()}
+
+    @staticmethod
+    def _int_param(params: dict[str, str], name: str, default: int) -> int:
+        raw = params.get(name, "")
+        if raw == "":
+            return default
+        if not re.fullmatch(r"\d{1,6}", raw):
+            raise APIError(400, f"{name} must be a non-negative integer")
+        return int(raw)
+
     def _read_json(self) -> dict[str, Any]:
         if self.headers.get("Transfer-Encoding"):
             self.close_connection = True
@@ -2235,11 +2849,21 @@ class TeleflowRequestHandler(http.server.BaseHTTPRequestHandler):
             if self.service.password is None:
                 self._send_json(200, {"ok": True})
                 return
+            peer = str(self.client_address[0]) if self.client_address else "unknown"
+            retry_after = self.service.login_retry_after(peer)
+            if retry_after is not None:
+                raise APIError(
+                    429,
+                    "Too many failed login attempts; wait before retrying",
+                    retry_after,
+                )
             password = data.get("password")
             if not isinstance(password, str) or not secrets.compare_digest(
                 password.encode("utf-8"), self.service.password.encode("utf-8")
             ):
+                self.service.record_login_failure(peer)
                 raise APIError(401, "Invalid password")
+            self.service.record_login_success(peer)
             token = self.service.issue_session()
             self._set_session_cookie(token, SESSION_TTL_SECONDS)
             self._send_json(200, {"ok": True})
@@ -2256,6 +2880,53 @@ class TeleflowRequestHandler(http.server.BaseHTTPRequestHandler):
 
         if path == "/api/subscribers" and method == "GET":
             self._send_json(200, {"items": self.service.list_subscribers()})
+            return
+        if path == "/api/subscribers/export":
+            if method != "GET":
+                raise APIError(405, "Method not allowed")
+            stamp = self.service._now().strftime("%Y%m%d")
+            self._send_bytes(
+                200,
+                self.service.export_subscribers_csv(),
+                "text/csv; charset=utf-8",
+                [
+                    (
+                        "Content-Disposition",
+                        f'attachment; filename="teleflow-subscribers-{stamp}.csv"',
+                    )
+                ],
+            )
+            return
+        match = re.fullmatch(r"/api/subscribers/(-?\d{1,19})", path)
+        if match:
+            chat_id = int(match.group(1))
+            if chat_id <= 0 or chat_id > 2**63 - 1:
+                raise APIError(404, "Subscriber not found")
+            if method == "PATCH":
+                data = self._read_json()
+                if set(data) != {"opted_in"} or not isinstance(data["opted_in"], bool):
+                    raise APIError(
+                        400, "PATCH subscriber accepts only opted_in boolean"
+                    )
+                if data["opted_in"]:
+                    raise APIError(
+                        400,
+                        "Only the subscriber can restore consent by sending /start",
+                    )
+                self._send_json(200, {"item": self.service.opt_out_subscriber(chat_id)})
+            elif method == "DELETE":
+                self.service.erase_subscriber(chat_id)
+                self._send_json(200, {"ok": True, "erased": True})
+            else:
+                raise APIError(405, "Method not allowed")
+            return
+        if path == "/api/sequence":
+            if method == "GET":
+                self._send_json(200, self.service.get_sequence())
+            elif method == "PUT":
+                self._send_json(200, self.service.save_sequence(self._read_json()))
+            else:
+                raise APIError(405, "Method not allowed")
             return
         if path == "/api/chats":
             if method == "GET":
@@ -2282,7 +2953,9 @@ class TeleflowRequestHandler(http.server.BaseHTTPRequestHandler):
             else:
                 raise APIError(405, "Method not allowed")
             return
-        match = re.fullmatch(r"/api/campaigns/(\d+)(?:/(schedule|send|retry))?", path)
+        match = re.fullmatch(
+            r"/api/campaigns/(\d+)(?:/(schedule|send|retry|cancel|deliveries))?", path
+        )
         if match:
             campaign_id = self._require_id(match.group(1), "Campaign")
             action = match.group(2)
@@ -2300,6 +2973,21 @@ class TeleflowRequestHandler(http.server.BaseHTTPRequestHandler):
             elif action == "retry" and method == "POST":
                 self._read_json()
                 self._send_json(202, self.service.retry_failed_campaign(campaign_id))
+            elif action == "cancel" and method == "POST":
+                self._read_json()
+                self._send_json(200, self.service.cancel_campaign_schedule(campaign_id))
+            elif action == "deliveries" and method == "GET":
+                params = self._query_params()
+                status = params.get("status") or None
+                self._send_json(
+                    200,
+                    self.service.campaign_deliveries(
+                        campaign_id,
+                        None if status == "all" else status,
+                        self._int_param(params, "limit", 50),
+                        self._int_param(params, "offset", 0),
+                    ),
+                )
             elif action is None and method == "PUT":
                 self._send_json(
                     200, self.service.update_campaign(campaign_id, self._read_json())
@@ -2410,10 +3098,50 @@ class TeleflowRequestHandler(http.server.BaseHTTPRequestHandler):
                 return
             match = re.fullmatch(r"/api/accounts/([1-9]\d{0,18})", path)
             if match:
-                if method != "DELETE":
+                if method == "DELETE":
+                    accounts.remove(int(match.group(1)))
+                    self._send_json(200, {"ok": True, "revoked": True})
+                elif method == "PATCH":
+                    data = self._read_json()
+                    if set(data) != {"label"}:
+                        raise APIError(400, "PATCH account accepts only label")
+                    self._send_json(
+                        200,
+                        {
+                            "item": accounts.rename_account(
+                                int(match.group(1)), data["label"]
+                            )
+                        },
+                    )
+                else:
                     raise APIError(405, "Method not allowed")
-                accounts.remove(int(match.group(1)))
-                self._send_json(200, {"ok": True, "revoked": True})
+                return
+            match = re.fullmatch(r"/api/accounts/([1-9]\d{0,18})/check", path)
+            if match:
+                if method != "POST":
+                    raise APIError(405, "Method not allowed")
+                self._read_json()
+                self._send_json(
+                    200, {"item": accounts.check_account(int(match.group(1)))}
+                )
+                return
+            match = re.fullmatch(r"/api/accounts/([1-9]\d{0,18})/profile", path)
+            if match:
+                if method == "GET":
+                    self._send_json(
+                        200, {"item": accounts.get_profile(int(match.group(1)))}
+                    )
+                elif method == "PUT":
+                    self._send_json(
+                        200,
+                        {
+                            "item": accounts.save_profile(
+                                int(match.group(1)), self._read_json()
+                            )
+                        },
+                    )
+                else:
+                    raise APIError(405, "Method not allowed")
                 return
             match = re.fullmatch(r"/api/accounts/([1-9]\d{0,18})/forget", path)
             if match:

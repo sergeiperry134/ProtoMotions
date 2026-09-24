@@ -14,6 +14,16 @@ from typing import Any
 from accounts import AccountError
 
 
+_RPC_HINTS = {
+    "USERNAME_OCCUPIED": "This username is already taken",
+    "USERNAME_INVALID": "Telegram rejected this username",
+    "USERNAME_UNEDITABLE": "Telegram does not allow changing this username",
+    "ABOUT_TOO_LONG": "Telegram rejected this bio as too long",
+    "FIRSTNAME_INVALID": "Telegram rejected this first name",
+    "LASTNAME_INVALID": "Telegram rejected this last name",
+}
+
+
 class TelethonGateway:
     def __init__(self, api_id: int, api_hash: str):
         try:
@@ -60,7 +70,13 @@ class TelethonGateway:
             raise AccountError(
                 429, "Telegram requires a pause before another request", seconds
             ) from None
-        except self._rpc_error:
+        except self._rpc_error as error:
+            message = str(getattr(error, "message", None) or error)
+            hint = next(
+                (text for code, text in _RPC_HINTS.items() if code in message), None
+            )
+            if hint is not None:
+                raise AccountError(400, f"{hint} ({message})") from None
             raise AccountError(502, "Telegram rejected the account request") from None
         except (ConnectionError, OSError, asyncio.TimeoutError):
             raise AccountError(503, "Could not reach Telegram") from None
@@ -98,11 +114,24 @@ class TelethonGateway:
             raise AccountError(409, "Account identity is unavailable")
         if getattr(me, "bot", False):
             raise AccountError(400, "Bot sessions cannot be imported as user accounts")
+        reasons = getattr(me, "restriction_reason", None) or []
+        restriction = "; ".join(
+            text
+            for text in (
+                str(
+                    getattr(reason, "text", "") or getattr(reason, "reason", "")
+                ).strip()
+                for reason in reasons
+            )
+            if text
+        )[:300]
         return {
             "id": me.id,
             "display_name": " ".join(filter(None, (me.first_name, me.last_name)))[:80]
             or f"Account {me.id}",
             "username": me.username,
+            "restricted": bool(getattr(me, "restricted", False)),
+            "restriction": restriction or None,
         }
 
     def inspect(self, session: str) -> tuple[dict[str, Any], str]:
@@ -116,6 +145,56 @@ class TelethonGateway:
                 await client.disconnect()
 
         return self._submit(operation())
+
+    def check(self, account_id: int, session: str) -> tuple[dict[str, Any], str]:
+        async def action(client: Any) -> dict[str, Any]:
+            return await self._identity(client)
+
+        return self._with_account(account_id, session, action)
+
+    async def _profile_fields(self, client: Any) -> dict[str, Any]:
+        me = await client.get_me()
+        about = ""
+        try:
+            from telethon.tl.functions.users import GetFullUserRequest
+
+            full = await client(GetFullUserRequest(me))
+            about = str(getattr(getattr(full, "full_user", None), "about", "") or "")
+        except (self._rpc_error, AttributeError, ImportError):
+            pass  # The bio is optional; profile editing must work without it.
+        return {
+            "first_name": str(getattr(me, "first_name", "") or ""),
+            "last_name": str(getattr(me, "last_name", "") or ""),
+            "username": str(getattr(me, "username", "") or ""),
+            "about": about,
+        }
+
+    def profile(self, account_id: int, session: str) -> tuple[dict[str, Any], str]:
+        async def action(client: Any) -> dict[str, Any]:
+            return await self._profile_fields(client)
+
+        return self._with_account(account_id, session, action)
+
+    def update_profile(
+        self,
+        account_id: int,
+        session: str,
+        first_name: str,
+        last_name: str,
+        username: str,
+        about: str,
+    ) -> tuple[dict[str, Any], str]:
+        # Empty last_name/username/about clear those fields; first_name is required.
+        async def action(client: Any) -> dict[str, Any]:
+            await client.edit_profile(
+                first_name=first_name,
+                last_name=last_name,
+                about=about,
+                username=username,
+            )
+            return await self._profile_fields(client)
+
+        return self._with_account(account_id, session, action)
 
     async def _client(self, account_id: int, session: str) -> Any:
         client = self._clients.get(account_id)
