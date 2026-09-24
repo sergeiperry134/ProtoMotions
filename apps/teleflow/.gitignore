@@ -5,3 +5,6 @@ __pycache__/
 *.sqlite3-wal
 *.sqlite3.lock
 .env
+.venv/
+*.session
+*.session-journal
