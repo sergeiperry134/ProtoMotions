@@ -15,6 +15,7 @@ const glyphs = {
   clock: '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',
   close: '<path d="M18 6 6 18M6 6l12 12"/>',
   copy: '<rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/>',
+  download: '<path d="M12 4v11m-5-5 5 5 5-5M5 20h14"/>',
   edit: '<path d="m16 4 4 4M4 20l4.5-1 11-11a2.8 2.8 0 0 0-4-4l-11 11L4 20Z"/>',
   external: '<path d="M13 5h6v6M19 5l-9 9"/><path d="M19 13v5a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1h5"/>',
   filter: '<path d="M4 7h16M7 12h10m-7 5h4"/>',
@@ -62,6 +63,7 @@ const statuses = { draft: 'Черновик', scheduled: 'Запланирова
 const navItems = [
   { id: 'overview', label: 'Обзор', icon: 'layers', group: 'main' },
   { id: 'campaigns', label: 'Рассылки', icon: 'send', group: 'main' },
+  { id: 'automation', label: 'Автоворонка', icon: 'bolt', group: 'main' },
   { id: 'people', label: 'Аудитория', icon: 'users', group: 'main' },
   { id: 'inbox', label: 'Входящие', icon: 'inbox', group: 'main' },
   { id: 'accounts', label: 'Telegram-аккаунты', icon: 'users', group: 'main' },
@@ -91,6 +93,7 @@ const state = {
   selectedChat: null, messages: [], contact: null, modal: null, aiText: '',
   accounts: [], selectedAccount: null, accountDialogs: [], accountDialogsTruncated: false,
   selectedAccountDialog: null, accountConversation: null, accountLoading: false, replyAttempts: readReplyAttempts(),
+  sequence: null, sequenceDraft: null, sequenceDirty: false,
   filters: { campaigns: 'all', people: 'all', campaignSearch: '', audienceSearch: '', inboxSearch: '' },
 };
 
@@ -125,6 +128,7 @@ function lockWorkspace({ signOut = false } = {}) {
     selectedChat: null, messages: [], contact: null, modal: null, aiText: '',
     accounts: [], selectedAccount: null, accountDialogs: [], accountDialogsTruncated: false,
     selectedAccountDialog: null, accountConversation: null, accountLoading: false, replyAttempts: [],
+    sequence: null, sequenceDraft: null, sequenceDirty: false,
     filters: { campaigns: 'all', people: 'all', campaignSearch: '', audienceSearch: '', inboxSearch: '' },
   });
   render();
@@ -169,6 +173,8 @@ function toast(message, error = false) {
   setTimeout(() => element.remove(), 4500);
 }
 
+const copySequence = sequence => ({ enabled: Boolean(sequence?.enabled), steps: (sequence?.steps || []).map(step => ({ delay_minutes: step.delay_minutes, body: step.body })) });
+
 async function loadAll({ silent = false } = {}) {
   const version = authVersion;
   if (!silent) { state.loading = true; render(); }
@@ -176,16 +182,19 @@ async function loadAll({ silent = false } = {}) {
     const status = await api('/status');
     if (version !== authVersion) return;
     state.status = status;
-    const [campaigns, subscribers, chats, inbox, rules, analytics, accounts] = await Promise.all([
+    const [campaigns, subscribers, chats, inbox, rules, analytics, accounts, sequence] = await Promise.all([
       api('/campaigns'), api('/subscribers'), api('/chats'), api('/inbox'), api('/rules'), api('/analytics'),
       canUseAccounts() ? api('/accounts') : Promise.resolve({ items: [] }),
+      api('/sequence'),
     ]);
     if (version !== authVersion) return;
     Object.assign(state, {
       campaigns: campaigns.items || [], subscribers: subscribers.items || [], chats: chats.items || [],
       inbox: inbox.items || [], rules: rules.items || [], analytics, accounts: accounts.items || [],
-      authGate: false,
+      sequence, authGate: false,
     });
+    // Keep unsaved funnel edits when the periodic refresh runs.
+    if (!state.sequenceDirty) state.sequenceDraft = copySequence(sequence);
     if (state.selectedAccount && !state.accounts.some(item => String(item.id) === state.selectedAccount)) {
       state.selectedAccount = null; state.accountDialogs = []; state.selectedAccountDialog = null;
       state.accountConversation = null;
@@ -270,13 +279,14 @@ function empty(ico, title, description, action = '', compact = false) {
 
 function campaignActions(item) {
   const title = safe(item.title);
+  const reportButton = `<button type="button" data-action="campaign-report" data-id="${item.id}" aria-label="Отчёт о доставке: ${title}" title="Отчёт о доставке">${icon('chart', 14)}</button>`;
   if (['draft', 'scheduled'].includes(item.status)) {
     return `<button type="button" data-action="edit-campaign" data-id="${item.id}" aria-label="Редактировать ${title}" title="Редактировать">${icon('edit', 14)}</button><button type="button" data-action="schedule-campaign" data-id="${item.id}" aria-label="Запланировать ${title}" title="Запланировать">${icon('calendar', 14)}</button>${item.status === 'scheduled' ? `<button type="button" data-action="cancel-schedule" data-id="${item.id}" aria-label="Отменить расписание: ${title}" title="Отменить расписание">${icon('close', 14)}</button>` : ''}<button type="button" data-action="send-campaign" data-id="${item.id}" aria-label="Отправить ${title}" title="Отправить" ${canSend() ? '' : 'disabled'}>${icon('send', 14)}</button><button type="button" data-action="delete-campaign" data-id="${item.id}" aria-label="Удалить ${title}" title="Удалить">${icon('trash', 14)}</button>`;
   }
   if (['partial', 'failed'].includes(item.status) && item.failed_count) {
-    return `<button type="button" data-action="retry-campaign" data-id="${item.id}" aria-label="Повторить неудачные отправки: ${title}" title="Повторить неудачные отправки" ${canSend() ? '' : 'disabled'}>${icon('refresh', 14)}</button>`;
+    return `${reportButton}<button type="button" data-action="retry-campaign" data-id="${item.id}" aria-label="Повторить неудачные отправки: ${title}" title="Повторить неудачные отправки" ${canSend() ? '' : 'disabled'}>${icon('refresh', 14)}</button>`;
   }
-  return '';
+  return ['sending', 'completed', 'partial', 'failed'].includes(item.status) ? reportButton : '';
 }
 
 function campaignRows(items, compact = false) {
@@ -312,14 +322,38 @@ function campaignsPage() {
     <div class="notice" style="margin-top:17px">${icon('shield', 16)}<p><strong>Без незапрошенных сообщений.</strong> Рассылки подписчикам идут только тем, кто сам запустил вашего бота и не отключил уведомления командой /stop. Публикация в каналах доступна, если бот — администратор.</p></div>`;
 }
 
+const delayFactors = [[1440, 'дней'], [60, 'часов'], [1, 'минут']];
+const splitDelay = minutes => {
+  const factor = delayFactors.find(([value]) => minutes > 0 && minutes % value === 0)?.[0] || 1;
+  return [minutes / factor, factor];
+};
+
+function automationPage() {
+  if (!state.sequence) return `${heading('Автоворонка', 'Приветственная цепочка для тех, кто сам запустил вашего бота.')}${banner()}<section class="panel">${empty('bolt', 'Автоворонка не загружена', 'Обновите данные, чтобы увидеть и редактировать сохранённую цепочку.', `<button type="button" class="btn btn-small" data-action="refresh">${icon('refresh', 14)} Обновить</button>`)}</section>`;
+  const draft = state.sequenceDraft || { enabled: false, steps: [] };
+  const stats = state.sequence?.stats || { active: 0, completed: 0, stopped: 0, failed: 0 };
+  const steps = draft.steps.map((step, index) => {
+    const [amount, factor] = splitDelay(step.delay_minutes);
+    return `<div class="sequence-step"><div class="sequence-step-head"><strong>Шаг ${index + 1}</strong><div class="sequence-delay"><label for="seqDelay${index}">${index ? 'Через' : 'После /start через'}</label><input id="seqDelay${index}" type="number" min="0" step="1" value="${amount}" data-seq-index="${index}" data-seq-field="amount" /><select aria-label="Единица задержки, шаг ${index + 1}" data-seq-index="${index}" data-seq-field="unit">${delayFactors.map(([value, label]) => `<option value="${value}" ${value === factor ? 'selected' : ''}>${label}</option>`).join('')}</select></div><button type="button" class="icon-button" data-action="seq-remove-step" data-index="${index}" aria-label="Удалить шаг ${index + 1}" title="Удалить шаг">${icon('trash', 14)}</button></div>
+      <textarea class="sequence-body" aria-label="Текст шага ${index + 1}" maxlength="4096" required data-seq-index="${index}" data-seq-field="body" placeholder="Привет, {first_name}! Спасибо за подписку…">${safe(step.body)}</textarea></div>`;
+  }).join('');
+  return `${heading('Автоворонка', 'Приветственная цепочка для тех, кто сам запустил вашего бота.')}${banner()}
+    <div class="stats-grid">${stat('В процессе', stats.active, 'Получают цепочку', 'clock')}${stat('Завершили', stats.completed, 'Получили все шаги', 'check', 'blue')}${stat('Остановлены', stats.stopped, '/stop или отписка', 'shield', 'orange')}${stat('Ошибки', stats.failed, 'Доставка не удалась', 'warning', 'purple')}</div>
+    <form id="sequenceForm" class="panel panel-pad"><div class="panel-head"><div><h2>Шаги цепочки</h2><p>До 10 сообщений · задержка считается от предыдущего сообщения</p></div><div class="sequence-toggle"><span>${draft.enabled ? 'Включена' : 'Выключена'}<em id="sequenceDirtyNote" ${state.sequenceDirty ? '' : 'hidden'}> · не сохранено</em></span><button type="button" class="switch${draft.enabled ? ' on' : ''}" role="switch" aria-checked="${draft.enabled}" aria-label="${draft.enabled ? 'Выключить' : 'Включить'} автоворонку" data-action="seq-toggle"></button></div></div>
+      ${steps || `<div class="notice">${icon('info', 16)}<p>Шагов пока нет. Добавьте приветствие, которое подписчик получит сразу после /start.</p></div>`}
+      <p class="settings-note">Подстановки: <code>{first_name}</code> — имя, <code>{username}</code> — username без @. Если значения нет, подставится пустая строка.</p>
+      <div class="sequence-actions"><button type="button" class="btn btn-secondary" data-action="seq-add-step" ${draft.steps.length >= 10 ? 'disabled' : ''}>${icon('plus', 14)} Добавить шаг</button><button type="button" class="text-link" data-action="seq-reset" ${state.sequenceDirty ? '' : 'hidden'}>Отменить изменения</button><button type="submit" class="btn" ${state.pending ? 'disabled' : ''}>${icon('check', 14)} Сохранить</button></div></form>
+    <div class="notice" style="margin-top:17px">${icon('shield', 16)}<p><strong>Только по согласию.</strong> Цепочка запускается после /start и сразу останавливается по /stop или ручной отписке. Повторный /start перезапускает только остановленную цепочку. Изменения применяются к запущенным цепочкам со следующего шага; выключение приостанавливает отправку.${canSend() ? '' : ' Сообщения начнут уходить после подключения бота.'}</p></div>`;
+}
+
 function audiencePage() {
   const active = state.subscribers.filter(item => item.opted_in).length;
   const filtered = state.subscribers.filter(item => (state.filters.people === 'all' || (state.filters.people === 'active' ? item.opted_in : !item.opted_in)) && `${item.first_name || ''} ${item.username || ''} ${item.chat_id}`.toLowerCase().includes(state.filters.audienceSearch.toLowerCase()));
   const bot = state.status?.telegram?.username;
-  return `${heading('Аудитория', 'Люди, которые сами запустили вашего Telegram-бота.', `<button type="button" class="btn btn-secondary" data-action="sync" ${canSend() ? '' : 'disabled'}>${icon('refresh', 14)} Синхронизировать</button>`)}${banner()}
+  return `${heading('Аудитория', 'Люди, которые сами запустили вашего Telegram-бота.', `<button type="button" class="btn btn-secondary" data-action="export-subscribers" ${state.subscribers.length && !state.pending ? '' : 'disabled'}>${icon('download', 14)} Экспорт CSV</button><button type="button" class="btn btn-secondary" data-action="sync" ${canSend() ? '' : 'disabled'}>${icon('refresh', 14)} Синхронизировать</button>`)}${banner()}
     <div class="page-grid"><div><div class="stats-grid" style="grid-template-columns:repeat(2,minmax(0,1fr))">${stat('Активные подписчики', active, 'Могут получать сообщения', 'users')}${stat('Отписались', state.subscribers.length - active, 'Больше не получают рассылки', 'shield', 'orange')}</div>
     <div class="toolbar"><div class="tabs" role="group" aria-label="Фильтр подписчиков">${[['all','Все'],['active','Подписаны'],['off','Отписались']].map(([id,label]) => `<button class="tab${state.filters.people === id ? ' active' : ''}" type="button" data-action="filter-people" data-filter="${id}">${label}</button>`).join('')}</div><label class="search-field">${icon('search', 15)}<input type="search" data-search="audienceSearch" value="${safe(state.filters.audienceSearch)}" placeholder="Имя или @username" aria-label="Найти подписчика" /></label></div>
-    <section class="panel">${filtered.length ? `<div class="table-wrap"><table><thead><tr><th>Подписчик</th><th>Telegram ID</th><th>Дата подписки</th><th>Статус</th><th aria-label="Действия"></th></tr></thead><tbody>${filtered.map(item => `<tr><td><div class="item-name"><span class="avatar">${safe(initials(displayName(item)))}</span><span><strong>${safe(displayName(item))}</strong><span class="subtext">${item.username ? `@${safe(item.username)}` : 'Без username'}</span></span></div></td><td>${safe(item.chat_id)}</td><td>${formatDate(item.joined_at)}</td><td><span class="dot${item.opted_in ? '' : ' off'}"></span>${item.opted_in ? 'Подписан' : 'Отписался'}</td><td><div class="table-actions">${item.opted_in ? `<button type="button" data-action="opt-out" data-id="${safe(item.chat_id)}" aria-label="Отписать ${safe(displayName(item))}" title="Отписать (opt-out)" ${state.pending ? 'disabled' : ''}>${icon('close', 14)}</button>` : ''}</div></td></tr>`).join('')}</tbody></table></div>` : state.subscribers.length ? empty('search','Ничего не найдено','Измените поисковый запрос или фильтр.') : empty('users','Здесь появятся подписчики','Поделитесь ссылкой на бота. Пользователи появятся здесь после команды /start.')}</section></div>
+    <section class="panel">${filtered.length ? `<div class="table-wrap"><table><thead><tr><th>Подписчик</th><th>Telegram ID</th><th>Дата подписки</th><th>Статус</th><th aria-label="Действия"></th></tr></thead><tbody>${filtered.map(item => `<tr><td><div class="item-name"><span class="avatar">${safe(initials(displayName(item)))}</span><span><strong>${safe(displayName(item))}</strong><span class="subtext">${item.username ? `@${safe(item.username)}` : 'Без username'}</span></span></div></td><td>${safe(item.chat_id)}</td><td>${formatDate(item.joined_at)}</td><td><span class="dot${item.opted_in ? '' : ' off'}"></span>${item.opted_in ? 'Подписан' : 'Отписался'}</td><td><div class="table-actions">${item.opted_in ? `<button type="button" data-action="opt-out" data-id="${safe(item.chat_id)}" aria-label="Отписать ${safe(displayName(item))}" title="Отписать (opt-out)" ${state.pending ? 'disabled' : ''}>${icon('close', 14)}</button>` : ''}<button type="button" data-action="erase-subscriber" data-id="${safe(item.chat_id)}" aria-label="Удалить данные ${safe(displayName(item))}" title="Удалить данные подписчика" ${state.pending ? 'disabled' : ''}>${icon('trash', 14)}</button></div></td></tr>`).join('')}</tbody></table></div>` : state.subscribers.length ? empty('search','Ничего не найдено','Измените поисковый запрос или фильтр.') : empty('users','Здесь появятся подписчики','Поделитесь ссылкой на бота. Пользователи появятся здесь после команды /start.')}</section></div>
     <div class="dashboard-stack"><section class="panel panel-pad"><div class="panel-head"><div><h2>Пригласите подписчиков</h2><p>Ссылка для вашего сайта или канала</p></div></div>${bot ? `<div class="code-line">https://t.me/${safe(bot)}?start=subscribe</div><button type="button" class="btn btn-secondary btn-small" data-action="copy-bot-link" style="margin-top:13px">${icon('copy', 13)} Скопировать ссылку</button>` : `<div class="notice warm">${icon('info', 15)}<p>Сначала подключите бота в настройках, затем появится его ссылка для подписки.</p></div>`}<p class="settings-note">Telegram разрешает боту написать пользователю только после того, как он сам запустит диалог.</p></section>
     <section class="panel panel-pad"><div class="panel-head"><div><h2>Приватность по умолчанию</h2><p>Подписка и отписка под контролем пользователя</p></div></div><div class="guide-list"><div class="guide-step"><span>01</span><div><strong>/start — подписаться</strong><p>Бот запоминает согласие на сообщения.</p></div></div><div class="guide-step"><span>02</span><div><strong>/stop — отписаться</strong><p>После этой команды рассылки не приходят.</p></div></div></div></section></div></div>`;
 }
@@ -395,6 +429,16 @@ function accountInbox() {
         <div class="composer-hint">${selected.kind === 'private' ? 'Только ручной ответ в диалоге с входящим сообщением. /start бота не считается согласием.' : 'Публикация вручную: только ваш канал или группа.'}${conversation && !conversation.can_send && selected.kind === 'private' && !blocked ? ' В этом личном диалоге нет входящего сообщения среди последних 100 — отправка запрещена.' : ''}</div></div>` : empty('message', 'Выберите диалог', 'История откроется после выбора существующего чата.', '', false)}</div></section>`;
 }
 
+const accountHealth = { ok: ['completed', 'Сессия активна'], restricted: ['scheduled', 'Есть ограничения'], unauthorized: ['failed', 'Сессия недействительна'], unknown: ['draft', 'Не проверен'] };
+const healthBadge = account => { const [style, label] = accountHealth[account.health] || accountHealth.unknown; return `<span class="badge ${style}">${label}</span>`; };
+
+function healthSummary(account) {
+  const checked = account.checked_at ? `проверено ${formatTime(account.checked_at)}` : 'ещё не проверялся';
+  if (account.health === 'unauthorized') return 'Telegram больше не принимает эту сессию. Создайте новую StringSession и подключите аккаунт заново.';
+  if (account.health === 'restricted') return `Telegram сообщает об ограничениях: ${account.health_detail || 'без подробностей'} · ${checked}`;
+  return `Ручные действия в Telegram · без автоматических рассылок · ${checked}`;
+}
+
 function accountsPage() {
   const introduction = `${heading('Telegram-аккаунты', 'Отдельный от бота кабинет для своих существующих диалогов и каналов.')}
     <div class="notice warm account-warning">${icon('lock', 17)}<p><strong>StringSession даёт полный доступ к вашему Telegram-аккаунту.</strong> Создавайте её только на доверенном устройстве, вводите исключительно на защищённой установке TeleFlow и не передавайте в чат, ссылки, логи или публичное демо. TeleFlow не сохраняет сессию в браузере; не разрешайте менеджеру паролей запоминать это поле.</p></div>`;
@@ -402,8 +446,8 @@ function accountsPage() {
   const active = state.accounts.find(item => String(item.id) === state.selectedAccount);
   return `${introduction}<div class="account-layout"><section class="panel panel-pad account-import"><div class="panel-head"><div><h2>Подключить свой аккаунт</h2><p>Импорт уже авторизованной Telethon StringSession · вход по номеру здесь не выполняется</p></div></div>
     <form id="accountImportForm" autocomplete="off"><div class="field"><label for="accountLabel">Метка аккаунта</label><input id="accountLabel" name="label" maxlength="80" placeholder="Например, основной" autocomplete="off" /></div><div class="field"><label for="accountSession">StringSession</label><input id="accountSession" name="session" type="password" maxlength="8192" placeholder="Вставьте готовую сессию" autocomplete="off" spellcheck="false" required /><small class="field-help">Поле очищается сразу после отправки. Сессия хранится на сервере только в зашифрованном виде.</small></div><button class="btn" type="submit" ${state.pending ? 'disabled' : ''}>${icon('plus', 14)} Подключить</button></form></section>
-    <section class="panel panel-pad account-list-panel"><div class="panel-head"><div><h2>Подключённые аккаунты</h2><p>Видны всем, кто знает пароль этой панели</p></div><span class="stat-icon">${icon('users', 17)}</span></div>${state.accounts.length ? `<div class="account-cards">${state.accounts.map(item => `<button type="button" class="account-card${String(item.id) === state.selectedAccount ? ' selected' : ''}" data-action="select-account" data-id="${safe(item.id)}" ${state.accountLoading ? 'disabled' : ''}><span class="avatar">${safe(initials(item.display_name))}</span><span><strong>${safe(item.display_name)}</strong><small>${item.username ? `@${safe(item.username)}` : `ID ${safe(item.id)}`}</small></span>${icon('chevron', 16)}</button>`).join('')}</div>` : empty('users', 'Аккаунтов пока нет', 'Подключите только аккаунт, который принадлежит вам.', '', true)}</section></div>
-    ${active ? `<div class="account-tools"><div><strong>${safe(active.display_name)}</strong><small>Ручные действия в Telegram · без автоматических рассылок</small></div><div class="account-actions"><button type="button" class="btn btn-secondary btn-small" data-action="refresh-account" ${state.accountLoading || state.pending ? 'disabled' : ''}>${icon('refresh', 13)} Обновить диалоги</button><button type="button" class="btn btn-danger btn-small" data-action="revoke-account" data-id="${safe(active.id)}" ${state.accountLoading || state.pending ? 'disabled' : ''}>Отозвать сессию</button><button type="button" class="text-link" data-action="forget-account" data-id="${safe(active.id)}" ${state.accountLoading || state.pending ? 'disabled' : ''}>Только удалить локально</button></div></div>${accountInbox()}` : `<section class="panel">${empty('inbox', 'Выберите аккаунт', 'После выбора увидите его существующие диалоги. TeleFlow не ищет незнакомых адресатов.', '', false)}</section>`}`;
+    <section class="panel panel-pad account-list-panel"><div class="panel-head"><div><h2>Подключённые аккаунты</h2><p>Видны всем, кто знает пароль этой панели</p></div><span class="stat-icon">${icon('users', 17)}</span></div>${state.accounts.length ? `<div class="account-cards">${state.accounts.map(item => `<button type="button" class="account-card${String(item.id) === state.selectedAccount ? ' selected' : ''}" data-action="select-account" data-id="${safe(item.id)}" ${state.accountLoading ? 'disabled' : ''}><span class="avatar">${safe(initials(item.display_name))}</span><span><strong>${safe(item.display_name)}</strong><small>${item.username ? `@${safe(item.username)}` : `ID ${safe(item.id)}`}</small>${healthBadge(item)}</span>${icon('chevron', 16)}</button>`).join('')}</div>` : empty('users', 'Аккаунтов пока нет', 'Подключите только аккаунт, который принадлежит вам.', '', true)}</section></div>
+    ${active ? `<div class="account-tools"><div><strong>${safe(active.display_name)}</strong><small>${safe(healthSummary(active))}</small></div><div class="account-actions"><button type="button" class="btn btn-secondary btn-small" data-action="refresh-account" ${state.accountLoading || state.pending ? 'disabled' : ''}>${icon('refresh', 13)} Обновить диалоги</button><button type="button" class="btn btn-secondary btn-small" data-action="check-account" data-id="${safe(active.id)}" ${state.accountLoading || state.pending ? 'disabled' : ''}>${icon('shield', 13)} Проверить</button><button type="button" class="btn btn-secondary btn-small" data-action="rename-account" data-id="${safe(active.id)}" ${state.accountLoading || state.pending ? 'disabled' : ''}>${icon('edit', 13)} Переименовать</button><button type="button" class="btn btn-danger btn-small" data-action="revoke-account" data-id="${safe(active.id)}" ${state.accountLoading || state.pending ? 'disabled' : ''}>Отозвать сессию</button><button type="button" class="text-link" data-action="forget-account" data-id="${safe(active.id)}" ${state.accountLoading || state.pending ? 'disabled' : ''}>Только удалить локально</button></div></div>${accountInbox()}` : `<section class="panel">${empty('inbox', 'Выберите аккаунт', 'После выбора увидите его существующие диалоги. TeleFlow не ищет незнакомых адресатов.', '', false)}</section>`}`;
 }
 
 function settingsPage() {
@@ -430,7 +474,7 @@ function modal() {
     content = `<form id="campaignForm"><div class="modal-grid"><div><div class="field"><label for="campaignTitle">Название кампании</label><input id="campaignTitle" name="title" maxlength="120" value="${safe(item?.title || '')}" placeholder="Например, Анонс нового выпуска" required autofocus /></div>
       <div class="field"><span>Получатели</span><div class="target-options"><label class="target-choice"><input type="radio" name="target_type" value="subscribers" ${target === 'subscribers' ? 'checked' : ''} /><span>${icon('users', 17)}<strong>Подписчики</strong><small>Те, кто запустил бота</small></span></label><label class="target-choice"><input type="radio" name="target_type" value="chat" ${target === 'chat' ? 'checked' : ''} /><span>${icon('message', 17)}<strong>Канал / группа</strong><small>Где бот — администратор</small></span></label></div></div>
       <div class="field" id="chatTargetWrap" ${target === 'chat' ? '' : 'hidden'}><label for="campaignChat">Выберите канал или группу</label><select id="campaignChat" name="chat_id"><option value="">Выберите из списка</option>${state.chats.map(chat => `<option value="${safe(chat.id)}" ${String(item?.chat_id) === String(chat.id) ? 'selected' : ''}>${safe(chat.title)}</option>`).join('')}</select>${state.chats.length ? '' : `<small class="field-help">Сначала добавьте канал в разделе «Каналы и чаты».</small>`}</div>
-      <div class="field"><label for="campaignBody">Текст сообщения</label><textarea id="campaignBody" name="body" maxlength="4096" placeholder="Здравствуйте! Расскажите, что нового у вашего проекта…" required>${safe(item?.body || data.prefill || '')}</textarea><small class="field-help"><span id="bodyCount">${(item?.body || data.prefill || '').length}</span> / 4096 символов · отправляется как обычный текст</small></div></div>
+      <div class="field"><label for="campaignBody">Текст сообщения</label><textarea id="campaignBody" name="body" maxlength="4096" placeholder="Здравствуйте! Расскажите, что нового у вашего проекта…" required>${safe(item?.body || data.prefill || '')}</textarea><small class="field-help"><span id="bodyCount">${(item?.body || data.prefill || '').length}</span> / 4096 символов · отправляется как обычный текст · для подписчиков: {first_name}, {username}</small></div></div>
       <div class="modal-preview"><span class="modal-preview-label">Предпросмотр сообщения</span><div class="preview-chat"><div class="preview-chat-top"><span class="avatar">TF</span><strong>Ваш Telegram-бот</strong></div><div class="preview-chat-bubble" id="previewMessage">${safe(item?.body || data.prefill || 'Ваше сообщение появится здесь…')}</div></div></div></div>
       <div class="modal-footer"><button class="btn btn-secondary" type="button" data-action="close-modal">Отмена</button><button class="btn" type="submit" ${state.pending ? 'disabled' : ''}>${icon('check', 14)} Сохранить черновик</button></div></form>`;
   } else if (data.type === 'schedule') {
@@ -456,6 +500,31 @@ function modal() {
   } else if (data.type === 'delete') {
     title = 'Удалить безвозвратно?'; description = 'Это действие нельзя отменить.';
     content = `<p style="color:var(--muted);font-size:11px;line-height:1.7;margin:0">${safe(data.label || 'Выбранный объект')} будет удалён из рабочего пространства.</p><div class="modal-footer"><button class="btn btn-secondary" type="button" data-action="close-modal">Отмена</button><button class="btn btn-danger" type="button" data-action="confirm-delete" ${state.pending ? 'disabled' : ''}>${icon('trash', 14)} Удалить</button></div>`;
+  } else if (data.type === 'deliveries') {
+    const campaign = state.campaigns.find(item => item.id === data.id);
+    title = 'Отчёт о доставке'; description = campaign?.title || ''; wide = true;
+    const report = data.report;
+    const counts = report?.counts || {};
+    const labels = { sent: ['completed', 'Доставлено'], failed: ['failed', 'Ошибка'], skipped: ['draft', 'Пропущено'], queued: ['sending', 'В очереди'], sending: ['sending', 'Отправляется'] };
+    const filters = [['all', 'Все'], ['failed', 'Ошибки'], ['sent', 'Доставлено'], ['skipped', 'Пропущено'], ['queued', 'В очереди']];
+    const rows = (report?.items || []).map(item => {
+      const [style, label] = labels[item.status] || ['draft', item.status];
+      const who = item.erased ? 'Данные удалены' : item.name || (item.username ? `@${item.username}` : item.chat_id);
+      const detail = item.error || (item.sent_at ? formatTime(item.sent_at) : item.next_attempt_at ? `Повтор: ${formatTime(item.next_attempt_at)}` : '—');
+      return `<tr><td><strong>${safe(who)}</strong>${!item.erased && item.name && item.username ? `<span class="subtext">@${safe(item.username)}</span>` : ''}</td><td><span class="badge ${style}">${label}</span></td><td>${number(item.attempt_count)}</td><td class="delivery-detail">${safe(detail)}</td></tr>`;
+    }).join('');
+    content = `<div class="delivery-summary">${[['sent', 'Доставлено'], ['failed', 'Ошибки'], ['skipped', 'Пропущено']].map(([key, label]) => `<span><strong>${number(counts[key] || 0)}</strong>${label}</span>`).join('')}<span><strong>${number((counts.queued || 0) + (counts.sending || 0))}</strong>В очереди</span></div>
+      <div class="tabs delivery-filter" role="group" aria-label="Фильтр доставок">${filters.map(([id, label]) => `<button type="button" class="tab${data.filter === id ? ' active' : ''}" data-action="delivery-filter" data-filter="${id}" ${data.loading ? 'disabled' : ''}>${label}</button>`).join('')}</div>
+      ${data.loading && !report ? `<div class="account-loading" role="status">Загружаем отчёт…</div>` : rows ? `<div class="table-wrap"><table><thead><tr><th>Получатель</th><th>Статус</th><th>Попыток</th><th>Детали</th></tr></thead><tbody>${rows}</tbody></table></div><p class="settings-note">Показано ${number(report.items.length)} из ${number(report.total)}. Ошибки выводятся первыми.</p>` : empty('chart', 'Записей нет', 'Для выбранного фильтра доставок нет.', '', true)}
+      <div class="modal-footer"><button type="button" class="btn btn-secondary" data-action="close-modal">Закрыть</button></div>`;
+  } else if (data.type === 'erase-subscriber') {
+    const subscriber = state.subscribers.find(item => String(item.chat_id) === String(data.id));
+    title = 'Удалить данные подписчика?'; description = subscriber ? displayName(subscriber) : '';
+    content = `<div class="notice warm">${icon('warning', 16)}<p>TeleFlow удалит подписчика, историю переписки, очередь автоответов и его автоворонку. В отчётах кампаний записи обезличиваются, итоги сохраняются. Если человек снова отправит /start, он появится как новый подписчик.</p></div><div class="modal-footer"><button type="button" class="btn btn-secondary" data-action="close-modal">Отмена</button><button type="button" class="btn btn-danger" data-action="confirm-erase-subscriber" ${state.pending ? 'disabled' : ''}>${icon('trash', 14)} Удалить данные</button></div>`;
+  } else if (data.type === 'account-rename') {
+    const account = state.accounts.find(item => String(item.id) === String(data.id));
+    title = 'Переименовать аккаунт'; description = 'Метка видна только в TeleFlow и не меняет профиль Telegram.';
+    content = `<form id="accountRenameForm"><div class="field"><label for="accountRenameLabel">Метка аккаунта</label><input id="accountRenameLabel" name="label" maxlength="80" value="${safe(account?.display_name || '')}" required autofocus autocomplete="off" /></div><div class="modal-footer"><button type="button" class="btn btn-secondary" data-action="close-modal">Отмена</button><button type="submit" class="btn" ${state.pending ? 'disabled' : ''}>${icon('check', 14)} Сохранить</button></div></form>`;
   } else if (data.type === 'account-revoke' || data.type === 'account-forget') {
     const account = state.accounts.find(item => String(item.id) === data.id);
     const forget = data.type === 'account-forget';
@@ -481,7 +550,7 @@ function loginPage() {
 function render() {
   if (state.authGate) { root.innerHTML = loginPage(); return; }
   if (state.loading && !state.status) { root.innerHTML = `<div class="initial-loader"><span class="loader"></span><span>Загружаем рабочее пространство…</span></div>`; return; }
-  const pages = { overview, campaigns: campaignsPage, people: audiencePage, inbox: inboxPage, accounts: accountsPage, channels: channelsPage, ai: aiPage, analytics: analyticsPage, settings: settingsPage };
+  const pages = { overview, campaigns: campaignsPage, automation: automationPage, people: audiencePage, inbox: inboxPage, accounts: accountsPage, channels: channelsPage, ai: aiPage, analytics: analyticsPage, settings: settingsPage };
   if (!pages[state.route]) state.route = 'overview';
   root.innerHTML = `<div class="app-shell">${sidebar()}<div class="main">${topbar()}<main class="content">${pages[state.route]()}</main></div>${modal()}</div>`;
   if (!canSend()) root.querySelectorAll('[data-action="schedule-campaign"]').forEach(button => {
@@ -563,6 +632,52 @@ async function selectChat(chatId) {
   } catch (error) { toast(error.message, true); }
 }
 
+async function loadDeliveries(filter) {
+  const modal = state.modal;
+  if (modal?.type !== 'deliveries') return;
+  modal.filter = filter; modal.loading = true; render();
+  try {
+    const query = new URLSearchParams({ limit: '100' });
+    if (filter !== 'all') query.set('status', filter);
+    const report = await api(`/campaigns/${encodeURIComponent(modal.id)}/deliveries?${query}`);
+    if (state.modal === modal) modal.report = report;
+  } catch (error) { if (!state.authGate) toast(error.message, true); }
+  finally { if (state.modal === modal) { modal.loading = false; render(); } }
+}
+
+async function downloadSubscribers() {
+  const response = await fetch('/api/subscribers/export', { credentials: 'same-origin' });
+  if (!response.ok) {
+    let payload;
+    try { payload = await response.json(); } catch { payload = {}; }
+    if (response.status === 401 && payload.error === 'Authentication required' && !state.authGate) { lockWorkspace(); broadcastAuthLock(false); }
+    throw new Error(payload.error || `Ошибка запроса (${response.status})`);
+  }
+  const url = URL.createObjectURL(await response.blob());
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = `teleflow-subscribers-${new Date().toISOString().slice(0, 10)}.csv`;
+  document.body.append(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+function updateSequenceField(element) {
+  const step = state.sequenceDraft?.steps[Number(element.dataset.seqIndex)];
+  if (!step) return;
+  if (element.dataset.seqField === 'body') step.body = element.value;
+  else {
+    const row = element.closest('.sequence-step');
+    const amount = Number(row?.querySelector('[data-seq-field="amount"]')?.value || 0);
+    const factor = Number(row?.querySelector('[data-seq-field="unit"]')?.value || 1);
+    step.delay_minutes = Number.isFinite(amount) && amount > 0 ? Math.round(amount * factor) : 0;
+  }
+  state.sequenceDirty = true;
+  root.querySelector('#sequenceDirtyNote')?.removeAttribute('hidden');
+  root.querySelector('[data-action="seq-reset"]')?.removeAttribute('hidden');
+}
+
 async function doAction(element) {
   const action = element.dataset.action;
   const id = element.dataset.id;
@@ -604,6 +719,55 @@ async function doAction(element) {
     finally { state.pending = false; render(); }
     return;
   }
+  if (action === 'campaign-report') { state.modal = { type: 'deliveries', id: Number(id), filter: 'all', report: null, loading: true }; await loadDeliveries('all'); return; }
+  if (action === 'delivery-filter') { await loadDeliveries(element.dataset.filter || 'all'); return; }
+  if (action === 'export-subscribers') {
+    if (state.pending) return;
+    state.pending = true; render();
+    try { await downloadSubscribers(); toast('CSV с подписчиками сохранён'); }
+    catch (error) { toast(error.message, true); }
+    finally { state.pending = false; render(); }
+    return;
+  }
+  if (action === 'erase-subscriber') { if (!state.pending) { state.modal = { type: 'erase-subscriber', id }; render(); } return; }
+  if (action === 'confirm-erase-subscriber') {
+    if (state.pending || state.modal?.type !== 'erase-subscriber') return;
+    const chatId = state.modal.id;
+    state.pending = true; render();
+    try {
+      await api(`/subscribers/${encodeURIComponent(chatId)}`, { method: 'DELETE' });
+      state.modal = null;
+      if (String(state.selectedChat) === String(chatId)) { state.selectedChat = null; state.messages = []; state.contact = null; }
+      await loadAll({ silent: true });
+      toast('Данные подписчика удалены');
+    } catch (error) { toast(error.message, true); }
+    finally { state.pending = false; render(); }
+    return;
+  }
+  if (action === 'seq-toggle') { if (state.sequence && state.sequenceDraft) { state.sequenceDraft.enabled = !state.sequenceDraft.enabled; state.sequenceDirty = true; render(); } return; }
+  if (action === 'seq-add-step') {
+    const draft = state.sequenceDraft;
+    if (!state.sequence || !draft || draft.steps.length >= 10) return;
+    draft.steps.push({ delay_minutes: draft.steps.length ? 1440 : 0, body: '' });
+    state.sequenceDirty = true; render();
+    root.querySelectorAll('.sequence-body')[draft.steps.length - 1]?.focus();
+    return;
+  }
+  if (action === 'seq-remove-step') { state.sequenceDraft?.steps.splice(Number(element.dataset.index), 1); state.sequenceDirty = true; render(); return; }
+  if (action === 'seq-reset') { state.sequenceDraft = copySequence(state.sequence); state.sequenceDirty = false; render(); return; }
+  if (action === 'check-account') {
+    if (state.pending || state.accountLoading) return;
+    state.pending = true; render();
+    try {
+      const result = await api(`/accounts/${encodeURIComponent(id)}/check`, { method: 'POST' });
+      state.accounts = state.accounts.map(item => String(item.id) === String(id) ? result.item : item);
+      const outcomes = { ok: 'Сессия активна, ограничений не найдено', restricted: 'Telegram сообщает об ограничениях аккаунта', unauthorized: 'Сессия недействительна — подключите аккаунт заново' };
+      toast(outcomes[result.item.health] || 'Проверка завершена', result.item.health !== 'ok');
+    } catch (error) { toast(error.message, true); }
+    finally { state.pending = false; render(); }
+    return;
+  }
+  if (action === 'rename-account') { if (!state.pending) { state.modal = { type: 'account-rename', id }; render(); } return; }
   if (action === 'select-account') { if (!state.pending) await selectAccount(id); return; }
   if (action === 'select-account-dialog') { if (!state.pending) await selectAccountDialog(id); return; }
   if (action === 'refresh-account') { if (!state.pending && state.selectedAccount) await selectAccount(state.selectedAccount); return; }
@@ -795,11 +959,11 @@ root.addEventListener('submit', async event => {
         });
         if (!Number.isSafeInteger(result.message?.id) || result.message.id < 1) throw new Error('Отправка не подтверждена; проверьте Telegram');
       } catch (error) {
-        if ([400, 403, 404, 429].includes(error.status)) forgetReplyAttempt(accountId, dialogId, requestId);
+        // Every 409 from send happens before Telegram is contacted, so nothing was sent.
+        if ([400, 403, 404, 409, 429].includes(error.status)) forgetReplyAttempt(accountId, dialogId, requestId);
         else if (error.status !== 401) {
           await selectAccountDialog(dialogId);
           const attempt = replyAttemptFor(accountId, dialogId);
-          if (error.status === 409 && attempt?.status === 'missing') forgetReplyAttempt(accountId, dialogId, requestId);
           if (attempt?.status === 'sent') return;
         }
         throw error;
@@ -834,6 +998,17 @@ root.addEventListener('submit', async event => {
       await api(`/inbox/${encodeURIComponent(state.selectedChat)}/reply`, { method: 'POST', body: JSON.stringify({ body: values.body.trim() }) });
       await selectChat(state.selectedChat);
       await loadAll({ silent: true }); toast('Ответ отправлен');
+    } else if (form.id === 'sequenceForm') {
+      if (!state.sequence) throw new Error('Автоворонка ещё не загружена — обновите данные');
+      const draft = state.sequenceDraft || { enabled: false, steps: [] };
+      const result = await api('/sequence', { method: 'PUT', body: JSON.stringify({ enabled: draft.enabled, steps: draft.steps.map(step => ({ delay_minutes: step.delay_minutes, body: step.body })) }) });
+      Object.assign(state, { sequence: result, sequenceDraft: copySequence(result), sequenceDirty: false });
+      render(); toast(result.enabled ? 'Автоворонка сохранена и включена' : 'Автоворонка сохранена');
+    } else if (form.id === 'accountRenameForm') {
+      const accountId = state.modal?.id;
+      const result = await api(`/accounts/${encodeURIComponent(accountId)}`, { method: 'PATCH', body: JSON.stringify({ label: values.label?.trim() || '' }) });
+      state.accounts = state.accounts.map(item => String(item.id) === String(accountId) ? result.item : item);
+      state.modal = null; render(); toast('Метка аккаунта обновлена');
     }
   } catch (error) { toast(error.message, true); }
   finally {
@@ -844,6 +1019,7 @@ root.addEventListener('submit', async event => {
 });
 
 root.addEventListener('input', event => {
+  if (event.target.dataset.seqField) { updateSequenceField(event.target); return; }
   if (event.target.dataset.search) {
     const name = event.target.dataset.search;
     const position = event.target.selectionStart;
@@ -862,6 +1038,7 @@ root.addEventListener('input', event => {
 });
 
 root.addEventListener('change', event => {
+  if (event.target.dataset.seqField) { updateSequenceField(event.target); return; }
   if (event.target.name === 'target_type') {
     const group = root.querySelector('#chatTargetWrap');
     if (group) group.hidden = event.target.value !== 'chat';

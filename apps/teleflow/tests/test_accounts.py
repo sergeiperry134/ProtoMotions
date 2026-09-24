@@ -76,6 +76,9 @@ class FakeGateway:
         self.revoke_calls = []
         self.forget_calls = []
         self.revoke_error = None
+        self.check_calls = []
+        self.check_result = None
+        self.check_error = None
         self.next_message_id = 900
         self.closed = False
 
@@ -153,6 +156,19 @@ class FakeGateway:
         self.revoke_calls.append(account_id)
         if self.revoke_error is not None:
             raise self.revoke_error
+
+    def check(self, account_id, session):
+        self._check_session(account_id, session)
+        self.check_calls.append(account_id)
+        if self.check_error is not None:
+            raise self.check_error
+        profile = self.check_result or {
+            "id": account_id,
+            "restricted": False,
+            "restriction": None,
+            "username": f"test_{account_id}",
+        }
+        return dict(profile), session
 
     def forget(self, account_id):
         self.forget_calls.append(account_id)
@@ -617,6 +633,110 @@ class AccountManagerTests(unittest.TestCase):
         self.assertEqual(self.gateway.revoke_calls, [101])
         self.assertEqual(self.gateway.forget_calls, [101])
 
+    def test_account_check_records_restricted_and_revoked_sessions(self):
+        imported = self.add_account("health-session", 101)
+        self.assertEqual(imported["health"], "ok")
+        self.assertEqual(imported["checked_at"], "2026-01-02T12:00:00Z")
+
+        self.gateway.check_result = {
+            "id": 101,
+            "restricted": True,
+            "restriction": "Spam reports",
+            "username": "fresh_name",
+        }
+        self.clock.advance(60)
+        checked = self.manager.check_account(101)
+        self.assertEqual(
+            (checked["health"], checked["health_detail"], checked["username"]),
+            ("restricted", "Spam reports", "fresh_name"),
+        )
+        self.assertEqual(checked["checked_at"], "2026-01-02T12:01:00Z")
+
+        self.gateway.check_error = AccountError(
+            409, "This account session is no longer authorized"
+        )
+        revoked = self.manager.check_account(101)
+        self.assertEqual(revoked["health"], "unauthorized")
+        self.assertEqual(revoked["username"], "fresh_name")
+
+        self.gateway.check_error = AccountError(503, "Could not reach Telegram")
+        with self.assertRaises(AccountError) as unreachable:
+            self.manager.check_account(101)
+        self.assertEqual(unreachable.exception.status, 503)
+        self.assertEqual(self.manager.list_accounts()[0]["health"], "unauthorized")
+
+        self.gateway.check_error = None
+        self.gateway.check_result = {
+            "id": 101,
+            "restricted": False,
+            "restriction": None,
+            "username": None,
+        }
+        cleared = self.manager.check_account(101)
+        self.assertEqual((cleared["health"], cleared["username"]), ("ok", None))
+
+    def test_revoked_session_send_is_rejected_and_does_not_block_dialog(self):
+        self.add_account("revoked-send-session", 101)
+        request_id = str(uuid.uuid4())
+        self.gateway.send_errors.append(
+            AccountError(409, "This account session is no longer authorized")
+        )
+
+        with self.assertRaises(AccountError) as raised:
+            self.manager.send_reply(101, 777, "reply", request_id)
+
+        self.assertEqual(raised.exception.status, 409)
+        self.assertEqual(self.outbox_row(request_id)["state"], "rejected")
+        self.assertEqual(self.manager.list_accounts()[0]["health"], "unauthorized")
+        self.assertEqual(self.manager.conversation(101, 777)["unresolved"], [])
+
+    def test_rename_account_validates_label(self):
+        self.add_account("rename-session", 101)
+
+        renamed = self.manager.rename_account(101, "  Основной  ")
+
+        self.assertEqual(renamed["display_name"], "Основной")
+        for label in ("", "   ", "x" * 81, None, 5):
+            with self.subTest(label=label):
+                with self.assertRaises(AccountError) as invalid:
+                    self.manager.rename_account(101, label)
+                self.assertEqual(invalid.exception.status, 400)
+        with self.assertRaises(AccountError) as missing:
+            self.manager.rename_account(202, "Other")
+        self.assertEqual(missing.exception.status, 404)
+
+    def test_history_pruning_keeps_unresolved_and_recent_outbox_rows(self):
+        self.add_account("prune-session", 101)
+        old = "2025-11-01T12:00:00Z"
+        recent = "2026-01-01T12:00:00Z"
+        with self.service._transaction() as connection:
+            connection.executemany(
+                """INSERT INTO user_account_outbox
+                   (request_id, account_id, dialog_id, body_hash, state, created_at,
+                    reviewed_at)
+                   VALUES (?, 101, 777, 'hash', ?, ?, ?)""",
+                [
+                    ("sent-old", "sent", old, None),
+                    ("rejected-old", "rejected", old, None),
+                    ("reviewed-old", "unknown", old, "2025-11-02T00:00:00Z"),
+                    ("unreviewed-old", "unknown", old, None),
+                    ("sent-recent", "sent", recent, None),
+                ],
+            )
+
+        self.assertEqual(
+            self.service.prune_history(),
+            {"processed_updates": 0, "account_outbox": 3},
+        )
+        with self.service._connection() as connection:
+            remaining = sorted(
+                row["request_id"]
+                for row in connection.execute(
+                    "SELECT request_id FROM user_account_outbox"
+                )
+            )
+        self.assertEqual(remaining, ["sent-recent", "unreviewed-old"])
+
 
 @unittest.skipUnless(
     CRYPTOGRAPHY_AVAILABLE, "cryptography is an optional account dependency"
@@ -878,6 +998,59 @@ class AccountHTTPTests(LocalHTTPMixin, unittest.TestCase):
         self.assertEqual(response["message"], {"id": 901, "already_sent": True})
         self.assertEqual(len(self.gateway.send_calls), 1)
 
+    def test_account_check_and_rename_require_login_and_same_origin(self):
+        self.gateway.register_session("http-health-session", 101)
+        status, _, login_headers = self.login()
+        self.assertEqual(status, 200)
+        cookie = self.cookie_header(login_headers["set-cookie"])
+        status, _, _ = self.request(
+            "POST",
+            "/api/accounts",
+            {"session": "http-health-session"},
+            headers={"Cookie": cookie},
+        )
+        self.assertEqual(status, 201)
+
+        for method, path, payload in (
+            ("POST", "/api/accounts/101/check", {}),
+            ("PATCH", "/api/accounts/101", {"label": "Новый"}),
+        ):
+            with self.subTest(path=path):
+                status, _, _ = self.request(method, path, payload)
+                self.assertEqual(status, 401)
+                status, _, _ = self.request(
+                    method,
+                    path,
+                    payload,
+                    headers={"Cookie": cookie},
+                    origin=f"http://attacker.invalid:{self.port}",
+                )
+                self.assertEqual(status, 403)
+        self.assertEqual(self.gateway.check_calls, [])
+
+        status, checked, _ = self.request(
+            "POST", "/api/accounts/101/check", {}, headers={"Cookie": cookie}
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(checked["item"]["health"], "ok")
+        self.assertEqual(self.gateway.check_calls, [101])
+        self.assertNotIn("session", json.dumps(checked))
+        status, renamed, _ = self.request(
+            "PATCH",
+            "/api/accounts/101",
+            {"label": "Новый"},
+            headers={"Cookie": cookie},
+        )
+        self.assertEqual((status, renamed["item"]["display_name"]), (200, "Новый"))
+        status, response, _ = self.request(
+            "PATCH",
+            "/api/accounts/101",
+            {"label": "Новый", "session": "must-not-be-accepted"},
+            headers={"Cookie": cookie},
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(response["error"], "PATCH account accepts only label")
+
     def test_flood_wait_returns_retry_after_header_and_enforces_cooldown(self):
         self.gateway.register_session("http-flood-session", 101)
         status, _, login_headers = self.login()
@@ -1030,6 +1203,7 @@ class FakeStringSession:
 class FakeTelethonRuntime:
     account_ids: ClassVar[dict[str, int]] = {}
     unauthorized_sessions: ClassVar[set[str]] = set()
+    restrictions: ClassVar[dict[str, list[Any]]] = {}
     dialogs: ClassVar[dict[str, list[Any]]] = {}
     messages: ClassVar[dict[str, list[Any]]] = {}
     fail_dialogs: ClassVar[dict[str, Exception]] = {}
@@ -1041,6 +1215,7 @@ class FakeTelethonRuntime:
     def reset(cls):
         cls.account_ids = {}
         cls.unauthorized_sessions = set()
+        cls.restrictions = {}
         cls.dialogs = {}
         cls.messages = {}
         cls.fail_dialogs = {}
@@ -1088,12 +1263,15 @@ class FakeTelethonClient:
         return self.authorized
 
     async def get_me(self):
+        reasons = FakeTelethonRuntime.restrictions.get(self.session.serialized, [])
         return SimpleNamespace(
             id=self.account_id,
             bot=False,
             first_name="Ada",
             last_name="Lovelace",
             username=f"user_{self.account_id}",
+            restricted=bool(reasons),
+            restriction_reason=reasons,
         )
 
     async def get_dialogs(self, *, limit):
@@ -1185,7 +1363,13 @@ class TelethonGatewayTests(unittest.TestCase):
 
         self.assertEqual(
             profile,
-            {"id": 101, "display_name": "Ada Lovelace", "username": "user_101"},
+            {
+                "id": 101,
+                "display_name": "Ada Lovelace",
+                "username": "user_101",
+                "restricted": False,
+                "restriction": None,
+            },
         )
         self.assertEqual(saved_session, "source-session")
         client = FakeTelethonRuntime.clients[-1]
@@ -1374,6 +1558,25 @@ class TelethonGatewayTests(unittest.TestCase):
         self.assertFalse(self.gateway._thread.is_alive())
         self.assertTrue(client.disconnected)
         self.assertEqual(self.gateway._clients, {})
+
+    def test_check_reports_restriction_details_for_the_owned_session(self):
+        FakeTelethonRuntime.account_ids["restricted-session"] = 808
+        FakeTelethonRuntime.restrictions["restricted-session"] = [
+            SimpleNamespace(
+                platform="all", reason="spam", text="Limited after spam reports"
+            )
+        ]
+
+        profile, saved = self.gateway.check(808, "restricted-session")
+
+        self.assertTrue(profile["restricted"])
+        self.assertEqual(profile["restriction"], "Limited after spam reports")
+        self.assertEqual(saved, "restricted-session")
+        FakeTelethonRuntime.account_ids["revoked-session"] = 809
+        FakeTelethonRuntime.unauthorized_sessions.add("revoked-session")
+        with self.assertRaises(AccountError) as revoked:
+            self.gateway.check(809, "revoked-session")
+        self.assertEqual(revoked.exception.status, 409)
 
 
 if __name__ == "__main__":

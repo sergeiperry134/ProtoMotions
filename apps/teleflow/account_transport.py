@@ -98,11 +98,24 @@ class TelethonGateway:
             raise AccountError(409, "Account identity is unavailable")
         if getattr(me, "bot", False):
             raise AccountError(400, "Bot sessions cannot be imported as user accounts")
+        reasons = getattr(me, "restriction_reason", None) or []
+        restriction = "; ".join(
+            text
+            for text in (
+                str(
+                    getattr(reason, "text", "") or getattr(reason, "reason", "")
+                ).strip()
+                for reason in reasons
+            )
+            if text
+        )[:300]
         return {
             "id": me.id,
             "display_name": " ".join(filter(None, (me.first_name, me.last_name)))[:80]
             or f"Account {me.id}",
             "username": me.username,
+            "restricted": bool(getattr(me, "restricted", False)),
+            "restriction": restriction or None,
         }
 
     def inspect(self, session: str) -> tuple[dict[str, Any], str]:
@@ -116,6 +129,12 @@ class TelethonGateway:
                 await client.disconnect()
 
         return self._submit(operation())
+
+    def check(self, account_id: int, session: str) -> tuple[dict[str, Any], str]:
+        async def action(client: Any) -> dict[str, Any]:
+            return await self._identity(client)
+
+        return self._with_account(account_id, session, action)
 
     async def _client(self, account_id: int, session: str) -> Any:
         client = self._clients.get(account_id)

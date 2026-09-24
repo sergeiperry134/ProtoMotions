@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 import contextlib
+import csv
 import datetime as dt
 import http.client
 import io
@@ -24,8 +25,11 @@ from server import (
     TeleflowRequestHandler,
     TeleflowService,
     TeleflowHTTPServer,
+    csv_cell,
     is_public_demo_mode,
     main,
+    placeholder_worst_case_length,
+    render_placeholders,
     resolve_database_location,
 )
 
@@ -93,6 +97,57 @@ class FakeAI:
         return f"{tone}: {prompt}"
 
 
+class MutableClock:
+    def __init__(self):
+        self.value = dt.datetime(2026, 1, 2, 12, 0, tzinfo=dt.timezone.utc)
+
+    def __call__(self):
+        return self.value
+
+    def advance(self, seconds):
+        self.value += dt.timedelta(seconds=seconds)
+
+
+def private_update(update_id, text, user_id=42, **from_fields):
+    sender = {"id": user_id, "is_bot": False, "first_name": "Ada", **from_fields}
+    return {
+        "update_id": update_id,
+        "message": {
+            "message_id": update_id,
+            "date": 1767355200,
+            "chat": {"id": user_id, "type": "private"},
+            "from": sender,
+            "text": text,
+        },
+    }
+
+
+def http_call(host, port, method, path, payload=None, headers=None, same_origin=True):
+    connection = http.client.HTTPConnection(host, port, timeout=3)
+    body = None if payload is None else json.dumps(payload)
+    request_headers = dict(headers or {})
+    if method in {"POST", "PUT", "PATCH", "DELETE"} and same_origin:
+        request_headers.setdefault("Origin", f"http://{host}:{port}")
+    if body is not None:
+        request_headers["Content-Type"] = "application/json"
+        request_headers["Content-Length"] = str(len(body.encode("utf-8")))
+    connection.request(method, path, body=body, headers=request_headers)
+    response = connection.getresponse()
+    raw = response.read()
+    parsed = (
+        json.loads(raw.decode("utf-8"))
+        if raw and response.getheader("Content-Type", "").startswith("application/json")
+        else raw
+    )
+    result = (
+        response.status,
+        parsed,
+        {key.lower(): value for key, value in response.getheaders()},
+    )
+    connection.close()
+    return result
+
+
 class ServerCase(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -122,6 +177,24 @@ class ServerCase(unittest.TestCase):
         self.server.server_close()
         self.thread.join(timeout=2)
 
+    def serve(self, service):
+        def handler(*args, **kwargs):
+            return TeleflowRequestHandler(
+                *args, service=service, static_root=self.static, **kwargs
+            )
+
+        server = TeleflowHTTPServer(("127.0.0.1", 0), handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+
+        def cleanup():
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+        self.addCleanup(cleanup)
+        return server.server_address
+
     def request(self, method, path, payload=None, headers=None):
         connection = http.client.HTTPConnection(self.host, self.port, timeout=3)
         body = None if payload is None else json.dumps(payload)
@@ -145,19 +218,7 @@ class ServerCase(unittest.TestCase):
         return result
 
     def push_update(self, update_id, text, user_id=42, **from_fields):
-        sender = {"id": user_id, "is_bot": False, "first_name": "Ada", **from_fields}
-        self.bot.updates.append(
-            {
-                "update_id": update_id,
-                "message": {
-                    "message_id": update_id,
-                    "date": 1767355200,
-                    "chat": {"id": user_id, "type": "private"},
-                    "from": sender,
-                    "text": text,
-                },
-            }
-        )
+        self.bot.updates.append(private_update(update_id, text, user_id, **from_fields))
 
 
 class HTTPContractTests(ServerCase):
@@ -261,16 +322,6 @@ class HTTPContractTests(ServerCase):
         self.assertEqual(data["error"], "Cross-site request rejected")
 
     def test_login_lockout_blocks_brute_force_and_recovers(self):
-        class MutableClock:
-            def __init__(self):
-                self.value = dt.datetime(2026, 1, 2, 12, 0, tzinfo=dt.timezone.utc)
-
-            def __call__(self):
-                return self.value
-
-            def advance(self, seconds):
-                self.value += dt.timedelta(seconds=seconds)
-
         clock = MutableClock()
         auth_service = TeleflowService(
             self.root / "auth.sqlite3",
@@ -279,43 +330,10 @@ class HTTPContractTests(ServerCase):
             clock=clock,
         )
         self.addCleanup(auth_service.close)
-
-        def auth_handler(*args, **kwargs):
-            return TeleflowRequestHandler(
-                *args, service=auth_service, static_root=self.static, **kwargs
-            )
-
-        auth_server = TeleflowHTTPServer(("127.0.0.1", 0), auth_handler)
-        auth_thread = threading.Thread(target=auth_server.serve_forever, daemon=True)
-        auth_thread.start()
-
-        def cleanup():
-            auth_server.shutdown()
-            auth_server.server_close()
-            auth_thread.join(timeout=2)
-
-        self.addCleanup(cleanup)
-        host, port = auth_server.server_address
+        host, port = self.serve(auth_service)
 
         def auth_request(password):
-            connection = http.client.HTTPConnection(host, port, timeout=3)
-            body = json.dumps({"password": password})
-            connection.request(
-                "POST",
-                "/api/login",
-                body=body,
-                headers={
-                    "Origin": f"http://{host}:{port}",
-                    "Content-Type": "application/json",
-                    "Content-Length": str(len(body.encode("utf-8"))),
-                },
-            )
-            response = connection.getresponse()
-            raw = response.read()
-            parsed = json.loads(raw.decode("utf-8")) if raw else {}
-            headers = {key.lower(): value for key, value in response.getheaders()}
-            connection.close()
-            return response.status, parsed, headers
+            return http_call(host, port, "POST", "/api/login", {"password": password})
 
         for _ in range(5):
             status, data, headers = auth_request("wrong-password")
@@ -340,6 +358,49 @@ class HTTPContractTests(ServerCase):
         self.assertEqual(auth_service.login_retry_after("198.51.100.7"), 900)
         auth_service.record_login_success("198.51.100.7")
         self.assertIsNone(auth_service.login_retry_after("198.51.100.7"))
+
+    def test_new_data_routes_require_login_and_same_origin(self):
+        protected = TeleflowService(
+            self.root / "protected.sqlite3",
+            telegram=FakeTelegram(),
+            password="correct-password",
+        )
+        self.addCleanup(protected.close)
+        host, port = self.serve(protected)
+        pause = {"enabled": False, "steps": []}
+
+        for method, path, payload in (
+            ("GET", "/api/sequence", None),
+            ("PUT", "/api/sequence", pause),
+            ("GET", "/api/subscribers/export", None),
+            ("DELETE", "/api/subscribers/42", None),
+            ("GET", "/api/campaigns/1/deliveries", None),
+        ):
+            with self.subTest(method=method, path=path):
+                status, response, _ = http_call(host, port, method, path, payload)
+                self.assertEqual(
+                    (status, response["error"]), (401, "Authentication required")
+                )
+        _, _, login = http_call(
+            host, port, "POST", "/api/login", {"password": "correct-password"}
+        )
+        cookie = login["set-cookie"].split(";", 1)[0]
+        status, response, _ = http_call(
+            host,
+            port,
+            "PUT",
+            "/api/sequence",
+            pause,
+            headers={"Cookie": cookie, "Origin": "http://attacker.invalid"},
+            same_origin=False,
+        )
+        self.assertEqual(
+            (status, response["error"]), (403, "Cross-site request rejected")
+        )
+        status, _, _ = http_call(
+            host, port, "GET", "/api/sequence", headers={"Cookie": cookie}
+        )
+        self.assertEqual(status, 200)
 
     def test_cancel_scheduled_campaign_returns_it_to_draft(self):
         status, created, _ = self.request(
@@ -378,6 +439,400 @@ class HTTPContractTests(ServerCase):
         status, response, _ = self.request("POST", "/api/campaigns/999/cancel")
         self.assertEqual(status, 404)
         self.assertEqual(response["error"], "Campaign not found")
+
+    def test_sequence_api_validates_and_round_trips_steps(self):
+        status, empty, _ = self.request("GET", "/api/sequence")
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            empty,
+            {
+                "enabled": False,
+                "steps": [],
+                "stats": {"active": 0, "completed": 0, "stopped": 0, "failed": 0},
+            },
+        )
+        step = {"delay_minutes": 0, "body": "x"}
+        invalid = [
+            (
+                {"enabled": True, "steps": []},
+                "Add at least one step before enabling the sequence",
+            ),
+            ({"enabled": "yes", "steps": []}, "enabled must be a boolean"),
+            ({"enabled": False}, "Sequence needs exactly enabled and steps"),
+            (
+                {"enabled": False, "steps": [], "extra": 1},
+                "Sequence needs exactly enabled and steps",
+            ),
+            (
+                {"enabled": False, "steps": [step] * 11},
+                "steps must be a list of at most 10 items",
+            ),
+            (
+                {"enabled": False, "steps": [{"delay_minutes": -1, "body": "x"}]},
+                "Step 1 delay must be 0-43200 minutes",
+            ),
+            (
+                {"enabled": False, "steps": [{"delay_minutes": True, "body": "x"}]},
+                "Step 1 delay must be 0-43200 minutes",
+            ),
+            (
+                {
+                    "enabled": False,
+                    "steps": [step, {"delay_minutes": 43201, "body": "x"}],
+                },
+                "Step 2 delay must be 0-43200 minutes",
+            ),
+            (
+                {"enabled": False, "steps": [{"delay_minutes": 0, "body": "   "}]},
+                "Step 1 body is required",
+            ),
+            (
+                {"enabled": False, "steps": [{"delay_minutes": 0}]},
+                "Step 1 needs delay_minutes and body",
+            ),
+            (
+                {
+                    "enabled": False,
+                    "steps": [{"delay_minutes": 0, "body": "Hi {first_name}" * 70}],
+                },
+                "With placeholders the message may exceed 4096 characters",
+            ),
+            (
+                {
+                    "enabled": False,
+                    "steps": [{"delay_minutes": 0, "body": " {username} "}],
+                },
+                "Message needs text besides placeholders",
+            ),
+        ]
+        for payload, message in invalid:
+            with self.subTest(message=message):
+                status, response, _ = self.request("PUT", "/api/sequence", payload)
+                self.assertEqual((status, response["error"]), (400, message))
+
+        payload = {
+            "enabled": True,
+            "steps": [
+                {"delay_minutes": 0, "body": "Привет, {first_name}"},
+                {"delay_minutes": 1440, "body": "Завтра"},
+            ],
+        }
+        status, saved, _ = self.request("PUT", "/api/sequence", payload)
+        self.assertEqual(status, 200)
+        self.assertEqual((saved["enabled"], saved["steps"]), (True, payload["steps"]))
+        self.assertEqual(
+            self.request("GET", "/api/sequence")[1]["steps"], payload["steps"]
+        )
+
+    def test_campaign_placeholders_render_per_subscriber(self):
+        self.push_update(10, "/start", username="ada")
+        self.push_update(11, "/start", user_id=43, first_name="Bob")
+        self.request("POST", "/api/sync")
+        status, campaign, _ = self.request(
+            "POST",
+            "/api/campaigns",
+            {
+                "title": "Hi",
+                "body": "Привет, {first_name}! @{username}",
+                "target_type": "subscribers",
+            },
+        )
+        self.assertEqual(status, 201)
+        self.request("POST", f"/api/campaigns/{campaign['id']}/send")
+        self.service.dispatch_pending()
+
+        self.assertEqual(
+            sorted(message["text"] for message in self.bot.sent),
+            ["Привет, Ada! @ada", "Привет, Bob! @"],
+        )
+        conversation = self.request("GET", "/api/inbox/42")[1]
+        self.assertEqual(conversation["items"][-1]["body"], "Привет, Ada! @ada")
+        status, response, _ = self.request(
+            "POST",
+            "/api/campaigns",
+            {
+                "title": "Long",
+                "body": "Hi {first_name}" * 70,
+                "target_type": "subscribers",
+            },
+        )
+        self.assertEqual(
+            (status, response["error"]),
+            (400, "With placeholders the message may exceed 4096 characters"),
+        )
+        status, response, _ = self.request(
+            "POST",
+            "/api/campaigns",
+            {"title": "Only", "body": "{first_name}", "target_type": "subscribers"},
+        )
+        self.assertEqual(
+            (status, response["error"]),
+            (400, "Message needs text besides placeholders"),
+        )
+        self.request("POST", "/api/chats", {"chat_id": chr(64) + "test_channel"})
+        status, response, _ = self.request(
+            "POST",
+            "/api/campaigns",
+            {
+                "title": "Channel",
+                "body": "Hi {first_name}",
+                "target_type": "chat",
+                "chat_id": "-100123456",
+            },
+        )
+        self.assertEqual(
+            (status, response["error"]),
+            (400, "Placeholders are only available for bot subscribers"),
+        )
+
+    def test_campaign_delivery_report_lists_failures_first(self):
+        self.push_update(10, "/start", username="ada")
+        self.push_update(11, "/start", user_id=43, first_name="Bob")
+        self.request("POST", "/api/sync")
+        _, campaign, _ = self.request(
+            "POST",
+            "/api/campaigns",
+            {"title": "News", "body": "Update", "target_type": "subscribers"},
+        )
+        self.request("POST", f"/api/campaigns/{campaign['id']}/send")
+        self.bot.send_failures.append(
+            TelegramError("Forbidden: bot was blocked by the user")
+        )
+        self.service.dispatch_pending()
+
+        base = f"/api/campaigns/{campaign['id']}/deliveries"
+        status, report, _ = self.request("GET", base)
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            report["counts"],
+            {"queued": 0, "sending": 0, "sent": 1, "failed": 1, "skipped": 0},
+        )
+        self.assertEqual(report["total"], 2)
+        first = report["items"][0]
+        self.assertEqual(
+            (first["status"], first["error"], first["attempt_count"]),
+            ("failed", "Forbidden: bot was blocked by the user", 1),
+        )
+        self.assertIn(first["name"], {"Ada", "Bob"})
+        self.assertFalse(first["erased"])
+        _, failed_only, _ = self.request("GET", base + "?status=failed&limit=10")
+        self.assertEqual((failed_only["total"], len(failed_only["items"])), (1, 1))
+        _, page, _ = self.request("GET", base + "?status=all&limit=1&offset=1")
+        self.assertEqual(
+            (page["total"], [item["status"] for item in page["items"]]),
+            (2, ["sent"]),
+        )
+        for query, message in (
+            ("?status=bogus", "Unknown delivery status filter"),
+            ("?limit=0", "limit must be 1-200 and offset non-negative"),
+            ("?offset=-1", "offset must be a non-negative integer"),
+            ("?limit=abc", "limit must be a non-negative integer"),
+            ("?status=sent&status=failed", "Duplicate query parameter"),
+        ):
+            with self.subTest(query=query):
+                status, response, _ = self.request("GET", base + query)
+                self.assertEqual((status, response["error"]), (400, message))
+        status, response, _ = self.request("GET", "/api/campaigns/999/deliveries")
+        self.assertEqual((status, response["error"]), (404, "Campaign not found"))
+
+    def test_subscriber_export_is_spreadsheet_safe(self):
+        self.push_update(
+            10, "/start", first_name='=HYPERLINK("http://x")', username="ada"
+        )
+        self.push_update(11, "/start", user_id=43, first_name="Боб")
+        self.push_update(12, "/stop", user_id=43, first_name="Боб")
+        self.request("POST", "/api/sync")
+
+        status, body, headers = self.request("GET", "/api/subscribers/export")
+
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["Content-Type"], "text/csv; charset=utf-8")
+        self.assertEqual(
+            headers["Content-Disposition"],
+            'attachment; filename="teleflow-subscribers-20260102.csv"',
+        )
+        self.assertEqual(headers["Cache-Control"], "no-store")
+        text = body.decode("utf-8")
+        self.assertTrue(text.startswith("\ufeff"))
+        rows = list(csv.reader(io.StringIO(text[1:])))
+        self.assertEqual(
+            rows[0], ["chat_id", "first_name", "username", "status", "joined_at"]
+        )
+        by_id = {row[0]: row for row in rows[1:]}
+        self.assertEqual(
+            by_id["42"][1:4], ['\'=HYPERLINK("http://x")', "ada", "subscribed"]
+        )
+        self.assertEqual(by_id["43"][1:4], ["Боб", "", "unsubscribed"])
+        self.assertEqual(self.request("POST", "/api/subscribers/export")[0], 405)
+
+    def test_erasing_a_subscriber_removes_data_but_keeps_campaign_totals(self):
+        self.push_update(10, "/start", username="ada")
+        self.push_update(11, "/start", user_id=43, first_name="Bob")
+        self.request("POST", "/api/sync")
+        _, first, _ = self.request(
+            "POST",
+            "/api/campaigns",
+            {"title": "Sent", "body": "One", "target_type": "subscribers"},
+        )
+        self.request("POST", f"/api/campaigns/{first['id']}/send")
+        self.service.dispatch_pending()
+        _, second, _ = self.request(
+            "POST",
+            "/api/campaigns",
+            {"title": "Queued", "body": "Two", "target_type": "subscribers"},
+        )
+        self.request("POST", f"/api/campaigns/{second['id']}/send")
+
+        status, response, _ = self.request("DELETE", "/api/subscribers/42")
+
+        self.assertEqual((status, response), (200, {"ok": True, "erased": True}))
+        self.assertEqual(
+            [
+                item["chat_id"]
+                for item in self.request("GET", "/api/subscribers")[1]["items"]
+            ],
+            [43],
+        )
+        self.assertEqual(self.request("GET", "/api/inbox/42")[0], 404)
+        with self.service._connection() as connection:
+            for table in ("messages", "campaign_deliveries"):
+                self.assertEqual(
+                    connection.execute(
+                        f"SELECT COUNT(*) FROM {table} WHERE chat_id='42'"
+                    ).fetchone()[0],
+                    0,
+                )
+        report = self.request("GET", f"/api/campaigns/{first['id']}/deliveries")[1]
+        self.assertEqual(report["counts"]["sent"], 2)
+        erased = [item for item in report["items"] if item["erased"]]
+        self.assertEqual(len(erased), 1)
+        self.assertIsNone(erased[0]["chat_id"])
+        self.assertIsNone(erased[0]["name"])
+        campaigns = {
+            item["id"]: item
+            for item in self.request("GET", "/api/campaigns")[1]["items"]
+        }
+        self.assertEqual(campaigns[first["id"]]["sent_count"], 2)
+        self.assertEqual(campaigns[second["id"]]["recipient_count"], 1)
+
+        before = len(self.bot.sent)
+        self.service.dispatch_pending()
+        self.assertEqual(
+            [str(message["chat"]["id"]) for message in self.bot.sent[before:]], ["43"]
+        )
+        self.assertEqual(self.service.get_campaign(second["id"])["status"], "completed")
+        self.assertEqual(self.request("DELETE", "/api/subscribers/42")[0], 404)
+        self.assertEqual(self.request("DELETE", "/api/subscribers/0")[0], 404)
+
+    def test_retry_skips_deliveries_of_erased_subscribers(self):
+        self.push_update(10, "/start")
+        self.push_update(11, "/start", user_id=43, first_name="Bob")
+        self.request("POST", "/api/sync")
+        _, campaign, _ = self.request(
+            "POST",
+            "/api/campaigns",
+            {"title": "News", "body": "Update", "target_type": "subscribers"},
+        )
+        self.request("POST", f"/api/campaigns/{campaign['id']}/send")
+        self.bot.send_failures.append(
+            TelegramError("Forbidden: bot was blocked by the user")
+        )
+        self.service.dispatch_pending()
+        failed = self.request(
+            "GET", f"/api/campaigns/{campaign['id']}/deliveries?status=failed"
+        )[1]["items"][0]
+
+        self.assertEqual(
+            self.request("DELETE", f"/api/subscribers/{failed['chat_id']}")[0], 200
+        )
+        status, response, _ = self.request(
+            "POST", f"/api/campaigns/{campaign['id']}/retry"
+        )
+
+        self.assertEqual(
+            (status, response["error"]),
+            (409, "This campaign has no failed deliveries to retry"),
+        )
+        after = self.service.get_campaign(campaign["id"])
+        self.assertEqual(
+            (after["status"], after["sent_count"], after["failed_count"]),
+            ("partial", 1, 1),
+        )
+
+    def test_history_pruning_keeps_updates_with_pending_replies(self):
+        old, recent = "2025-12-20T00:00:00Z", "2026-01-01T00:00:00Z"
+        with self.service._transaction() as connection:
+            connection.executemany(
+                "INSERT INTO processed_updates(update_id, processed_at) VALUES (?, ?)",
+                [(1, old), (2, old), (3, old), (4, recent)],
+            )
+            connection.executemany(
+                """INSERT INTO reply_queue(update_id, chat_id, body, status, created_at)
+                   VALUES (?, 42, 'Reply', ?, ?)""",
+                [(2, "pending", old), (3, "sent", old)],
+            )
+
+        self.assertEqual(
+            self.service.prune_history(),
+            {"processed_updates": 2, "account_outbox": 0},
+        )
+        with self.service._connection() as connection:
+            self.assertEqual(
+                [
+                    row[0]
+                    for row in connection.execute(
+                        "SELECT update_id FROM processed_updates ORDER BY update_id"
+                    )
+                ],
+                [2, 4],
+            )
+            self.assertEqual(
+                [
+                    row[0]
+                    for row in connection.execute("SELECT update_id FROM reply_queue")
+                ],
+                [2],
+            )
+
+    def test_worker_prunes_history_when_it_starts(self):
+        pruned = threading.Event()
+
+        def record_prune():
+            pruned.set()
+            return {}
+
+        with patch.object(self.service, "prune_history", side_effect=record_prune):
+            worker = BackgroundWorker(self.service, interval=0.25)
+            worker.start()
+            try:
+                self.assertTrue(pruned.wait(3))
+            finally:
+                worker.stop()
+
+    def test_operator_opt_out_waits_for_in_flight_consent_checks(self):
+        self.push_update(10, "/start")
+        self.request("POST", "/api/sync")
+        holding, release = threading.Event(), threading.Event()
+
+        def hold_consent_lock():
+            with self.service._consent_lock:
+                holding.set()
+                release.wait(5)
+
+        holder = threading.Thread(target=hold_consent_lock)
+        holder.start()
+        self.assertTrue(holding.wait(2))
+        opt_out = threading.Thread(target=self.service.opt_out_subscriber, args=(42,))
+        opt_out.start()
+        opt_out.join(0.3)
+        self.assertTrue(opt_out.is_alive())
+        self.assertTrue(self.service.list_subscribers()[0]["opted_in"])
+
+        release.set()
+        opt_out.join(2)
+        holder.join(2)
+        self.assertFalse(opt_out.is_alive())
+        self.assertFalse(self.service.list_subscribers()[0]["opted_in"])
 
     def test_operator_opt_out_skips_pending_sends_and_cancels_replies(self):
         self.request(
@@ -1138,7 +1593,214 @@ class HTTPContractTests(ServerCase):
         self.assertIn("OPENAI_API_KEY", data["error"])
 
 
+class WelcomeSequenceTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.clock = MutableClock()
+        self.bot = FakeTelegram()
+        self.service = TeleflowService(
+            Path(self.temp.name) / "sequence.sqlite3",
+            telegram=self.bot,
+            send_interval=0,
+            clock=self.clock,
+        )
+        self.addCleanup(self.service.close)
+
+    def receive(self, update_id, text, user_id=42, **from_fields):
+        self.bot.updates.append(private_update(update_id, text, user_id, **from_fields))
+        self.assertEqual(self.service.poll_updates(), 1)
+
+    def sent_texts(self):
+        return [message["text"] for message in self.bot.sent]
+
+    def run_state(self, chat_id=42):
+        with self.service._connection() as connection:
+            return connection.execute(
+                "SELECT * FROM sequence_runs WHERE chat_id=?", (chat_id,)
+            ).fetchone()
+
+    def test_steps_are_personalized_and_follow_their_delays(self):
+        self.service.save_sequence(
+            {
+                "enabled": True,
+                "steps": [
+                    {"delay_minutes": 0, "body": "Привет, {first_name}!"},
+                    {"delay_minutes": 60, "body": "Шаг 2 для @{username}"},
+                ],
+            }
+        )
+        self.receive(1, "/start", username="ada")
+        self.assertEqual(self.service.get_sequence()["stats"]["active"], 1)
+
+        self.assertEqual(self.service.dispatch_pending(), 1)
+        self.assertEqual(self.sent_texts(), ["Привет, Ada!"])
+        self.clock.advance(3599)
+        self.assertEqual(self.service.dispatch_pending(), 0)
+        self.clock.advance(1)
+        self.assertEqual(self.service.dispatch_pending(), 1)
+        self.assertEqual(self.sent_texts(), ["Привет, Ada!", "Шаг 2 для @ada"])
+        self.assertEqual(
+            self.service.get_sequence()["stats"],
+            {"active": 0, "completed": 1, "stopped": 0, "failed": 0},
+        )
+        history = self.service.get_conversation(42)["items"]
+        self.assertEqual(
+            [item["body"] for item in history if item["direction"] == "out"],
+            ["Привет, Ada!", "Шаг 2 для @ada"],
+        )
+
+        self.receive(2, "/start")
+        self.clock.advance(3600)
+        self.assertEqual(self.service.dispatch_pending(), 0)
+        self.assertEqual(len(self.bot.sent), 2)
+
+    def test_stop_or_operator_opt_out_halts_and_new_start_restarts(self):
+        self.service.save_sequence(
+            {
+                "enabled": True,
+                "steps": [
+                    {"delay_minutes": 0, "body": "A"},
+                    {"delay_minutes": 60, "body": "B"},
+                ],
+            }
+        )
+        self.receive(1, "/start")
+        self.service.dispatch_pending()
+        self.receive(2, "/stop")
+        self.assertEqual(self.run_state()["status"], "stopped")
+        self.clock.advance(7200)
+        self.assertEqual(self.service.dispatch_pending(), 0)
+
+        self.receive(3, "/start")
+        run = self.run_state()
+        self.assertEqual((run["status"], run["step_index"]), ("active", 0))
+        self.service.dispatch_pending()
+        self.assertEqual(self.sent_texts(), ["A", "A"])
+
+        self.receive(4, "/start", user_id=43, first_name="Bob")
+        self.service.opt_out_subscriber(43)
+        self.assertEqual(self.run_state(43)["status"], "stopped")
+        self.assertEqual(self.service.dispatch_pending(), 0)
+        self.assertEqual(self.sent_texts(), ["A", "A"])
+
+    def test_disabling_pauses_and_failures_retry_or_stop(self):
+        steps = [
+            {"delay_minutes": 0, "body": "A"},
+            {"delay_minutes": 5, "body": "B"},
+        ]
+        self.service.save_sequence({"enabled": True, "steps": steps})
+        self.receive(1, "/start")
+        self.bot.send_failures.append(
+            TelegramError("Too Many Requests", retry_after=30, transient=True)
+        )
+        self.assertEqual(self.service.dispatch_pending(), 0)
+        run = self.run_state()
+        self.assertEqual(
+            (run["status"], run["next_at"], run["error"]),
+            ("active", "2026-01-02T12:00:30Z", "Too Many Requests"),
+        )
+        self.clock.advance(30)
+        self.assertEqual(self.service.dispatch_pending(), 1)
+
+        self.service.save_sequence({"enabled": False, "steps": steps})
+        self.clock.advance(600)
+        self.assertEqual(self.service.dispatch_pending(), 0)
+        self.service.save_sequence({"enabled": True, "steps": steps})
+        self.assertEqual(self.service.dispatch_pending(), 1)
+        self.assertEqual(self.sent_texts(), ["A", "B"])
+
+        self.receive(2, "/start", user_id=43)
+        self.bot.send_failures.append(
+            TelegramError("Forbidden: bot was blocked by the user")
+        )
+        self.assertEqual(self.service.dispatch_pending(), 0)
+        self.assertEqual(self.run_state(43)["status"], "failed")
+        self.assertEqual(self.service.get_sequence()["stats"]["failed"], 1)
+
+    def test_shortening_the_funnel_completes_runs_past_the_new_end(self):
+        self.service.save_sequence(
+            {
+                "enabled": True,
+                "steps": [
+                    {"delay_minutes": 0, "body": "A"},
+                    {"delay_minutes": 60, "body": "B"},
+                ],
+            }
+        )
+        self.receive(1, "/start")
+        self.service.dispatch_pending()
+        self.assertEqual(self.run_state()["step_index"], 1)
+
+        self.service.save_sequence(
+            {"enabled": True, "steps": [{"delay_minutes": 0, "body": "A"}]}
+        )
+
+        self.assertEqual(self.run_state()["status"], "completed")
+        self.clock.advance(3600)
+        self.assertEqual(self.service.dispatch_pending(), 0)
+
+    def test_restart_requeues_an_in_flight_step(self):
+        self.service.save_sequence(
+            {"enabled": True, "steps": [{"delay_minutes": 0, "body": "A"}]}
+        )
+        self.receive(1, "/start")
+        with self.service._transaction() as connection:
+            connection.execute("UPDATE sequence_runs SET status='sending'")
+        self.service.close()
+
+        reopened = TeleflowService(
+            self.service.db_path, telegram=self.bot, send_interval=0, clock=self.clock
+        )
+        self.addCleanup(reopened.close)
+
+        with reopened._connection() as connection:
+            self.assertEqual(
+                connection.execute("SELECT status FROM sequence_runs").fetchone()[0],
+                "active",
+            )
+        self.assertEqual(reopened.dispatch_pending(), 1)
+        self.assertEqual(self.sent_texts(), ["A"])
+
+    def test_a_run_reset_after_claim_does_not_send_the_stale_step(self):
+        self.service.save_sequence(
+            {
+                "enabled": True,
+                "steps": [
+                    {"delay_minutes": 0, "body": "STEP0"},
+                    {"delay_minutes": 60, "body": "STEP1"},
+                ],
+            }
+        )
+        self.receive(1, "/start")
+        self.service.dispatch_pending()
+        self.clock.advance(3600)
+        stale = self.service._claim_sequence_run()
+        self.assertEqual(stale["step_index"], 1)
+
+        self.receive(2, "/stop")
+        self.receive(3, "/start")
+
+        self.assertFalse(self.service._deliver_sequence_run(stale))
+        self.assertEqual(self.sent_texts(), ["STEP0"])
+        self.assertEqual(self.service.dispatch_pending(), 1)
+        self.assertEqual(self.sent_texts(), ["STEP0", "STEP0"])
+
+
 class ValidationTests(unittest.TestCase):
+    def test_placeholder_helpers_and_csv_cells_are_injection_safe(self):
+        self.assertEqual(
+            render_placeholders("Hi {first_name} @{username}", "{username}", None),
+            "Hi {username} @",
+        )
+        self.assertEqual(placeholder_worst_case_length("Hi {first_name}"), 67)
+        for value in ("=1+1", "+1", "-1", "@cmd", "\tx", "\rx"):
+            with self.subTest(value=value):
+                self.assertEqual(csv_cell(value), "'" + value)
+        self.assertEqual(csv_cell("Ада"), "Ада")
+        self.assertEqual(csv_cell(None), "")
+        self.assertEqual(csv_cell(42), "42")
+
     def test_non_loopback_bind_requires_auth_or_demo(self):
         from server import is_loopback_host
 
