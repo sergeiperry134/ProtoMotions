@@ -447,7 +447,7 @@ function accountsPage() {
   return `${introduction}<div class="account-layout"><section class="panel panel-pad account-import"><div class="panel-head"><div><h2>Подключить свой аккаунт</h2><p>Импорт уже авторизованной Telethon StringSession · вход по номеру здесь не выполняется</p></div></div>
     <form id="accountImportForm" autocomplete="off"><div class="field"><label for="accountLabel">Метка аккаунта</label><input id="accountLabel" name="label" maxlength="80" placeholder="Например, основной" autocomplete="off" /></div><div class="field"><label for="accountSession">StringSession</label><input id="accountSession" name="session" type="password" maxlength="8192" placeholder="Вставьте готовую сессию" autocomplete="off" spellcheck="false" required /><small class="field-help">Поле очищается сразу после отправки. Сессия хранится на сервере только в зашифрованном виде.</small></div><button class="btn" type="submit" ${state.pending ? 'disabled' : ''}>${icon('plus', 14)} Подключить</button></form></section>
     <section class="panel panel-pad account-list-panel"><div class="panel-head"><div><h2>Подключённые аккаунты</h2><p>Видны всем, кто знает пароль этой панели</p></div><span class="stat-icon">${icon('users', 17)}</span></div>${state.accounts.length ? `<div class="account-cards">${state.accounts.map(item => `<button type="button" class="account-card${String(item.id) === state.selectedAccount ? ' selected' : ''}" data-action="select-account" data-id="${safe(item.id)}" ${state.accountLoading ? 'disabled' : ''}><span class="avatar">${safe(initials(item.display_name))}</span><span><strong>${safe(item.display_name)}</strong><small>${item.username ? `@${safe(item.username)}` : `ID ${safe(item.id)}`}</small>${healthBadge(item)}</span>${icon('chevron', 16)}</button>`).join('')}</div>` : empty('users', 'Аккаунтов пока нет', 'Подключите только аккаунт, который принадлежит вам.', '', true)}</section></div>
-    ${active ? `<div class="account-tools"><div><strong>${safe(active.display_name)}</strong><small>${safe(healthSummary(active))}</small></div><div class="account-actions"><button type="button" class="btn btn-secondary btn-small" data-action="refresh-account" ${state.accountLoading || state.pending ? 'disabled' : ''}>${icon('refresh', 13)} Обновить диалоги</button><button type="button" class="btn btn-secondary btn-small" data-action="check-account" data-id="${safe(active.id)}" ${state.accountLoading || state.pending ? 'disabled' : ''}>${icon('shield', 13)} Проверить</button><button type="button" class="btn btn-secondary btn-small" data-action="rename-account" data-id="${safe(active.id)}" ${state.accountLoading || state.pending ? 'disabled' : ''}>${icon('edit', 13)} Переименовать</button><button type="button" class="btn btn-danger btn-small" data-action="revoke-account" data-id="${safe(active.id)}" ${state.accountLoading || state.pending ? 'disabled' : ''}>Отозвать сессию</button><button type="button" class="text-link" data-action="forget-account" data-id="${safe(active.id)}" ${state.accountLoading || state.pending ? 'disabled' : ''}>Только удалить локально</button></div></div>${accountInbox()}` : `<section class="panel">${empty('inbox', 'Выберите аккаунт', 'После выбора увидите его существующие диалоги. TeleFlow не ищет незнакомых адресатов.', '', false)}</section>`}`;
+    ${active ? `<div class="account-tools"><div><strong>${safe(active.display_name)}</strong><small>${safe(healthSummary(active))}</small></div><div class="account-actions"><button type="button" class="btn btn-secondary btn-small" data-action="refresh-account" ${state.accountLoading || state.pending ? 'disabled' : ''}>${icon('refresh', 13)} Обновить диалоги</button><button type="button" class="btn btn-secondary btn-small" data-action="check-account" data-id="${safe(active.id)}" ${state.accountLoading || state.pending ? 'disabled' : ''}>${icon('shield', 13)} Проверить</button><button type="button" class="btn btn-secondary btn-small" data-action="account-profile" data-id="${safe(active.id)}" ${state.accountLoading || state.pending ? 'disabled' : ''}>${icon('edit', 13)} Профиль</button><button type="button" class="btn btn-secondary btn-small" data-action="rename-account" data-id="${safe(active.id)}" ${state.accountLoading || state.pending ? 'disabled' : ''}>${icon('edit', 13)} Переименовать</button><button type="button" class="btn btn-danger btn-small" data-action="revoke-account" data-id="${safe(active.id)}" ${state.accountLoading || state.pending ? 'disabled' : ''}>Отозвать сессию</button><button type="button" class="text-link" data-action="forget-account" data-id="${safe(active.id)}" ${state.accountLoading || state.pending ? 'disabled' : ''}>Только удалить локально</button></div></div>${accountInbox()}` : `<section class="panel">${empty('inbox', 'Выберите аккаунт', 'После выбора увидите его существующие диалоги. TeleFlow не ищет незнакомых адресатов.', '', false)}</section>`}`;
 }
 
 function settingsPage() {
@@ -525,6 +525,20 @@ function modal() {
     const account = state.accounts.find(item => String(item.id) === String(data.id));
     title = 'Переименовать аккаунт'; description = 'Метка видна только в TeleFlow и не меняет профиль Telegram.';
     content = `<form id="accountRenameForm"><div class="field"><label for="accountRenameLabel">Метка аккаунта</label><input id="accountRenameLabel" name="label" maxlength="80" value="${safe(account?.display_name || '')}" required autofocus autocomplete="off" /></div><div class="modal-footer"><button type="button" class="btn btn-secondary" data-action="close-modal">Отмена</button><button type="submit" class="btn" ${state.pending ? 'disabled' : ''}>${icon('check', 14)} Сохранить</button></div></form>`;
+  } else if (data.type === 'account-profile') {
+    title = 'Профиль аккаунта в Telegram';
+    description = 'Изменения видны всем в Telegram и применяются только к этому вашему аккаунту.';
+    const profile = data.profile;
+    if (data.loading || !profile) {
+      content = `<div class="account-loading" role="status">Загружаем профиль из Telegram…</div><div class="modal-footer"><button type="button" class="btn btn-secondary" data-action="close-modal">Закрыть</button></div>`;
+    } else {
+      content = `<form id="accountProfileForm"><div class="field"><label for="profileFirstName">Имя</label><input id="profileFirstName" name="first_name" maxlength="64" value="${safe(profile.first_name)}" required autofocus autocomplete="off" /><small class="field-help">Обязательное поле, до 64 символов.</small></div>
+        <div class="field"><label for="profileLastName">Фамилия</label><input id="profileLastName" name="last_name" maxlength="64" value="${safe(profile.last_name)}" autocomplete="off" /></div>
+        <div class="field"><label for="profileUsername">Username</label><input id="profileUsername" name="username" maxlength="32" value="${safe(profile.username)}" autocomplete="off" spellcheck="false" /><small class="field-help">5–32 латинских символа, начинается с буквы. Пустое поле убирает username; смена меняет ваш @адрес. Занятый Telegram отклонит.</small></div>
+        <div class="field"><label for="profileAbout">О себе</label><textarea id="profileAbout" name="about" maxlength="140" placeholder="Короткое описание профиля">${safe(profile.about)}</textarea><small class="field-help">До 140 символов; пустое поле очищает.</small></div>
+        <div class="notice">${icon('info', 15)}<p>Это ручная настройка одного своего аккаунта. TeleFlow не меняет профили пакетно и не имитирует «разных людей».</p></div>
+        <div class="modal-footer"><button type="button" class="btn btn-secondary" data-action="close-modal">Отмена</button><button type="submit" class="btn" ${state.pending ? 'disabled' : ''}>${icon('check', 14)} Сохранить в Telegram</button></div></form>`;
+    }
   } else if (data.type === 'account-revoke' || data.type === 'account-forget') {
     const account = state.accounts.find(item => String(item.id) === data.id);
     const forget = data.type === 'account-forget';
@@ -768,6 +782,21 @@ async function doAction(element) {
     return;
   }
   if (action === 'rename-account') { if (!state.pending) { state.modal = { type: 'account-rename', id }; render(); } return; }
+  if (action === 'account-profile') {
+    if (state.pending) return;
+    state.modal = { type: 'account-profile', id, profile: null, loading: true }; render();
+    try {
+      const result = await api(`/accounts/${encodeURIComponent(id)}/profile`);
+      if (state.modal?.type === 'account-profile' && String(state.modal.id) === String(id)) {
+        state.modal.profile = result.item; state.modal.loading = false; render();
+      }
+    } catch (error) {
+      if (state.modal?.type === 'account-profile') state.modal = null;
+      if (!state.authGate) toast(error.message, true);
+      render();
+    }
+    return;
+  }
   if (action === 'select-account') { if (!state.pending) await selectAccount(id); return; }
   if (action === 'select-account-dialog') { if (!state.pending) await selectAccountDialog(id); return; }
   if (action === 'refresh-account') { if (!state.pending && state.selectedAccount) await selectAccount(state.selectedAccount); return; }
@@ -1009,6 +1038,17 @@ root.addEventListener('submit', async event => {
       const result = await api(`/accounts/${encodeURIComponent(accountId)}`, { method: 'PATCH', body: JSON.stringify({ label: values.label?.trim() || '' }) });
       state.accounts = state.accounts.map(item => String(item.id) === String(accountId) ? result.item : item);
       state.modal = null; render(); toast('Метка аккаунта обновлена');
+    } else if (form.id === 'accountProfileForm') {
+      const accountId = state.modal?.id;
+      const payload = {
+        first_name: values.first_name?.trim() || '',
+        last_name: values.last_name?.trim() || '',
+        username: (values.username?.trim() || '').replace(/^@+/, ''),
+        about: values.about?.trim() || '',
+      };
+      const result = await api(`/accounts/${encodeURIComponent(accountId)}/profile`, { method: 'PUT', body: JSON.stringify(payload) });
+      state.accounts = state.accounts.map(item => String(item.id) === String(accountId) ? { ...item, username: result.item.username || null } : item);
+      state.modal = null; render(); toast('Профиль обновлён в Telegram');
     }
   } catch (error) { toast(error.message, true); }
   finally {

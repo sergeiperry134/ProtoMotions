@@ -17,6 +17,9 @@ MAX_SENDS_PER_HOUR = 30
 MAX_SESSION_LENGTH = 8192
 MAX_MESSAGE_LENGTH = 4096
 ACCOUNT_HEALTH = ("ok", "restricted", "unauthorized")
+USERNAME_PATTERN = re.compile(r"[A-Za-z][A-Za-z0-9_]{4,31}")
+MAX_NAME_LENGTH = 64
+MAX_BIO_LENGTH = 140
 _KEEP = object()
 
 
@@ -224,6 +227,87 @@ class AccountManager:
             ).rowcount:
                 raise AccountError(404, "Account not found")
         return self._account_by_id(account_id)
+
+    def _validate_profile(self, data: dict[str, Any]) -> tuple[str, str, str, str]:
+        allowed = {"first_name", "last_name", "username", "about"}
+        if set(data) - allowed:
+            raise AccountError(
+                400, "Profile accepts first_name, last_name, username and about"
+            )
+        first_name = data.get("first_name")
+        if (
+            not isinstance(first_name, str)
+            or not first_name.strip()
+            or len(first_name.strip()) > MAX_NAME_LENGTH
+        ):
+            raise AccountError(400, "first_name must contain 1-64 characters")
+        last_name = data.get("last_name")
+        if last_name is None:
+            last_name = ""
+        if not isinstance(last_name, str) or len(last_name.strip()) > MAX_NAME_LENGTH:
+            raise AccountError(400, "last_name must be at most 64 characters")
+        username = data.get("username")
+        if username is None:
+            username = ""
+        if not isinstance(username, str):
+            raise AccountError(400, "username must be text")
+        username = username.strip().lstrip("@")
+        if username and not USERNAME_PATTERN.fullmatch(username):
+            raise AccountError(
+                400,
+                "username must be 5-32 latin letters, digits or underscores, "
+                "starting with a letter",
+            )
+        about = data.get("about")
+        if about is None:
+            about = ""
+        if not isinstance(about, str) or len(about.strip()) > MAX_BIO_LENGTH:
+            raise AccountError(
+                400, f"about must be at most {MAX_BIO_LENGTH} characters"
+            )
+        return (
+            first_name.strip(),
+            last_name.strip(),
+            username,
+            about.strip(),
+        )
+
+    def _store_username(self, account_id: int, username: str | None) -> None:
+        with self._service._transaction() as connection:
+            connection.execute(
+                "UPDATE user_accounts SET username=? WHERE id=?",
+                (username, account_id),
+            )
+
+    def get_profile(self, account_id: int) -> dict[str, Any]:
+        account_id = self._id(account_id)
+        with self._lock(account_id):
+            session = self._session(account_id)
+            try:
+                profile, updated = self._gateway.profile(account_id, session)
+            except AccountError as error:
+                self._note_unauthorized(account_id, error)
+                raise
+            self._save_session(account_id, session, updated)
+            return profile
+
+    def save_profile(self, account_id: int, data: Any) -> dict[str, Any]:
+        account_id = self._id(account_id)
+        if not isinstance(data, dict):
+            raise AccountError(400, "Profile must be a JSON object")
+        first_name, last_name, username, about = self._validate_profile(data)
+        with self._lock(account_id):
+            session = self._session(account_id)
+            try:
+                profile, updated = self._gateway.update_profile(
+                    account_id, session, first_name, last_name, username, about
+                )
+            except AccountError as error:
+                self._note_unauthorized(account_id, error)
+                raise
+            self._save_session(account_id, session, updated)
+            self._store_username(account_id, profile.get("username") or None)
+            return profile
 
     def prune_outbox(self, before: dt.datetime) -> int:
         cutoff = before.astimezone(dt.timezone.utc).replace(microsecond=0)

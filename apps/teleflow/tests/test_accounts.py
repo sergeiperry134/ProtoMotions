@@ -79,6 +79,10 @@ class FakeGateway:
         self.check_calls = []
         self.check_result = None
         self.check_error = None
+        self.account_profiles = {}
+        self.profile_calls = []
+        self.update_profile_calls = []
+        self.update_profile_error = None
         self.next_message_id = 900
         self.closed = False
 
@@ -87,6 +91,12 @@ class FakeGateway:
             "id": account_id,
             "display_name": f"Test Account {account_id}",
             "username": f"test_{account_id}",
+        }
+        self.account_profiles[account_id] = {
+            "first_name": "Ada",
+            "last_name": "Lovelace",
+            "username": f"test_{account_id}",
+            "about": "Initial bio",
         }
         updated = f"rotated-session-{account_id}-{len(self.updated_sessions) + 1}"
         self.updated_sessions[raw_session] = updated
@@ -172,6 +182,32 @@ class FakeGateway:
 
     def forget(self, account_id):
         self.forget_calls.append(account_id)
+
+    def profile(self, account_id, session):
+        self._check_session(account_id, session)
+        self.profile_calls.append(account_id)
+        stored = self.account_profiles.get(account_id)
+        if stored is None:
+            raise AccountError(404, "Profile is unavailable")
+        return dict(stored), session
+
+    def update_profile(
+        self, account_id, session, first_name, last_name, username, about
+    ):
+        self._check_session(account_id, session)
+        self.update_profile_calls.append(
+            (account_id, first_name, last_name, username, about)
+        )
+        if self.update_profile_error is not None:
+            raise self.update_profile_error
+        profile = {
+            "first_name": first_name,
+            "last_name": last_name,
+            "username": username,
+            "about": about,
+        }
+        self.account_profiles[account_id] = profile
+        return dict(profile), session
 
     def close(self):
         self.closed = True
@@ -705,6 +741,116 @@ class AccountManagerTests(unittest.TestCase):
             self.manager.rename_account(202, "Other")
         self.assertEqual(missing.exception.status, 404)
 
+    def test_profile_management_updates_telegram_and_stored_username(self):
+        self.add_account("profile-session", 101)
+
+        self.assertEqual(
+            self.manager.get_profile(101),
+            {
+                "first_name": "Ada",
+                "last_name": "Lovelace",
+                "username": "test_101",
+                "about": "Initial bio",
+            },
+        )
+
+        saved = self.manager.save_profile(
+            101,
+            {
+                "first_name": "Ада",
+                "last_name": "Лавлейс",
+                "username": "@ada_promo",
+                "about": "Пишу о проекте",
+            },
+        )
+
+        self.assertEqual(
+            saved,
+            {
+                "first_name": "Ада",
+                "last_name": "Лавлейс",
+                "username": "ada_promo",
+                "about": "Пишу о проекте",
+            },
+        )
+        self.assertEqual(
+            self.gateway.update_profile_calls,
+            [(101, "Ада", "Лавлейс", "ada_promo", "Пишу о проекте")],
+        )
+        self.assertEqual(self.manager.list_accounts()[0]["username"], "ada_promo")
+
+        cleared = self.manager.save_profile(
+            101, {"first_name": "Ада", "last_name": "", "username": "", "about": ""}
+        )
+        self.assertEqual(
+            (cleared["last_name"], cleared["username"], cleared["about"]),
+            ("", "", ""),
+        )
+        self.assertIsNone(self.manager.list_accounts()[0]["username"])
+
+    def test_profile_validation_rejects_bad_payloads(self):
+        self.add_account("profile-validation-session", 101)
+        invalid = [
+            ({"last_name": "Lovelace"}, "first_name must contain 1-64 characters"),
+            ({"first_name": "   "}, "first_name must contain 1-64 characters"),
+            ({"first_name": "x" * 65}, "first_name must contain 1-64 characters"),
+            (
+                {"first_name": "Ada", "last_name": "x" * 65},
+                "last_name must be at most 64 characters",
+            ),
+            ({"first_name": "Ada", "username": 5}, "username must be text"),
+            (
+                {"first_name": "Ada", "username": "1ada"},
+                "username must be 5-32 latin letters, digits or underscores, "
+                "starting with a letter",
+            ),
+            (
+                {"first_name": "Ada", "username": "a b c"},
+                "username must be 5-32 latin letters, digits or underscores, "
+                "starting with a letter",
+            ),
+            (
+                {"first_name": "Ada", "username": "x" * 33},
+                "username must be 5-32 latin letters, digits or underscores, "
+                "starting with a letter",
+            ),
+            (
+                {"first_name": "Ada", "about": "x" * 141},
+                "about must be at most 140 characters",
+            ),
+            (
+                {"first_name": "Ada", "extra": 1},
+                "Profile accepts first_name, last_name, username and about",
+            ),
+        ]
+        for payload, message in invalid:
+            with self.subTest(message=message):
+                with self.assertRaises(AccountError) as raised:
+                    self.manager.save_profile(101, payload)
+                self.assertEqual(
+                    (raised.exception.status, raised.exception.message), (400, message)
+                )
+        with self.assertRaises(AccountError) as not_object:
+            self.manager.save_profile(101, "Ada")
+        self.assertEqual(not_object.exception.status, 400)
+        self.assertEqual(self.gateway.update_profile_calls, [])
+        self.assertEqual(self.manager.list_accounts()[0]["username"], "test_101")
+
+    def test_occupied_username_is_rejected_without_changing_stored_data(self):
+        self.add_account("occupied-session", 101)
+        self.gateway.update_profile_error = AccountError(
+            400, "This username is already taken (USERNAME_OCCUPIED)"
+        )
+
+        with self.assertRaises(AccountError) as raised:
+            self.manager.save_profile(
+                101, {"first_name": "Ada", "username": "taken_name"}
+            )
+
+        self.assertEqual(raised.exception.status, 400)
+        self.assertIn("already taken", raised.exception.message)
+        self.assertEqual(self.manager.list_accounts()[0]["username"], "test_101")
+
     def test_history_pruning_keeps_unresolved_and_recent_outbox_rows(self):
         self.add_account("prune-session", 101)
         old = "2025-11-01T12:00:00Z"
@@ -1051,6 +1197,72 @@ class AccountHTTPTests(LocalHTTPMixin, unittest.TestCase):
         self.assertEqual(status, 400)
         self.assertEqual(response["error"], "PATCH account accepts only label")
 
+    def test_http_profile_requires_login_and_round_trips(self):
+        self.gateway.register_session("http-profile-session", 101)
+        status, _, login_headers = self.login()
+        self.assertEqual(status, 200)
+        cookie = self.cookie_header(login_headers["set-cookie"])
+        status, _, _ = self.request(
+            "POST",
+            "/api/accounts",
+            {"session": "http-profile-session"},
+            headers={"Cookie": cookie},
+        )
+        self.assertEqual(status, 201)
+
+        profile_path = "/api/accounts/101/profile"
+        status, response, _ = self.request("GET", profile_path)
+        self.assertEqual((status, response["error"]), (401, "Authentication required"))
+        status, response, _ = self.request(
+            "GET", profile_path, headers={"Cookie": cookie}, origin=None
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(response["item"]["first_name"], "Ada")
+        self.assertEqual(response["item"]["about"], "Initial bio")
+        self.assertNotIn("session", json.dumps(response))
+
+        payload = {
+            "first_name": "Ада",
+            "last_name": "",
+            "username": "ada_new",
+            "about": "Пишу о проекте",
+        }
+        status, response, _ = self.request("PUT", profile_path, payload)
+        self.assertEqual((status, response["error"]), (401, "Authentication required"))
+        status, response, _ = self.request(
+            "PUT",
+            profile_path,
+            payload,
+            headers={"Cookie": cookie},
+            origin=f"http://attacker.invalid:{self.port}",
+        )
+        self.assertEqual(
+            (status, response["error"]), (403, "Cross-site request rejected")
+        )
+        self.assertEqual(self.gateway.update_profile_calls, [])
+
+        status, response, _ = self.request(
+            "PUT", profile_path, payload, headers={"Cookie": cookie}
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(response["item"]["username"], "ada_new")
+        listed = self.request("GET", "/api/accounts", headers={"Cookie": cookie})[1]
+        self.assertEqual(listed["items"][0]["username"], "ada_new")
+        status, response, _ = self.request(
+            "PUT",
+            profile_path,
+            {"first_name": "Ада", "username": "1bad"},
+            headers={"Cookie": cookie},
+        )
+        self.assertEqual(
+            (status, response["error"]),
+            (
+                400,
+                "username must be 5-32 latin letters, digits or underscores, "
+                "starting with a letter",
+            ),
+        )
+
     def test_flood_wait_returns_retry_after_header_and_enforces_cooldown(self):
         self.gateway.register_session("http-flood-session", 101)
         status, _, login_headers = self.login()
@@ -1204,6 +1416,10 @@ class FakeTelethonRuntime:
     account_ids: ClassVar[dict[str, int]] = {}
     unauthorized_sessions: ClassVar[set[str]] = set()
     restrictions: ClassVar[dict[str, list[Any]]] = {}
+    abouts: ClassVar[dict[str, str]] = {}
+    names: ClassVar[dict[str, tuple[str, str]]] = {}
+    usernames: ClassVar[dict[str, str]] = {}
+    rpc_errors: ClassVar[dict[str, Exception]] = {}
     dialogs: ClassVar[dict[str, list[Any]]] = {}
     messages: ClassVar[dict[str, list[Any]]] = {}
     fail_dialogs: ClassVar[dict[str, Exception]] = {}
@@ -1216,6 +1432,10 @@ class FakeTelethonRuntime:
         cls.account_ids = {}
         cls.unauthorized_sessions = set()
         cls.restrictions = {}
+        cls.abouts = {}
+        cls.names = {}
+        cls.usernames = {}
+        cls.rpc_errors = {}
         cls.dialogs = {}
         cls.messages = {}
         cls.fail_dialogs = {}
@@ -1263,16 +1483,49 @@ class FakeTelethonClient:
         return self.authorized
 
     async def get_me(self):
+        first, last = FakeTelethonRuntime.names.get(
+            self.session.serialized, ("Ada", "Lovelace")
+        )
         reasons = FakeTelethonRuntime.restrictions.get(self.session.serialized, [])
         return SimpleNamespace(
             id=self.account_id,
             bot=False,
-            first_name="Ada",
-            last_name="Lovelace",
-            username=f"user_{self.account_id}",
+            first_name=first,
+            last_name=last,
+            username=FakeTelethonRuntime.usernames.get(
+                self.session.serialized, f"user_{self.account_id}"
+            ),
             restricted=bool(reasons),
             restriction_reason=reasons,
         )
+
+    async def __call__(self, _request):
+        # GetFullUserRequest response: only the bio matters to the gateway.
+        return SimpleNamespace(
+            full_user=SimpleNamespace(
+                about=FakeTelethonRuntime.abouts.get(self.session.serialized, "")
+            )
+        )
+
+    async def edit_profile(
+        self, *, first_name=None, last_name=None, about=None, username=None
+    ):
+        key = self.session.serialized
+        error = FakeTelethonRuntime.rpc_errors.get(key)
+        if error is not None:
+            raise error
+        current_first, current_last = FakeTelethonRuntime.names.get(
+            key, ("Ada", "Lovelace")
+        )
+        if first_name is not None:
+            current_first = first_name
+        if last_name is not None:
+            current_last = last_name
+        FakeTelethonRuntime.names[key] = (current_first, current_last)
+        if about is not None:
+            FakeTelethonRuntime.abouts[key] = about
+        if username is not None:
+            FakeTelethonRuntime.usernames[key] = username
 
     async def get_dialogs(self, *, limit):
         self.dialog_limits.append(limit)
@@ -1577,6 +1830,46 @@ class TelethonGatewayTests(unittest.TestCase):
         with self.assertRaises(AccountError) as revoked:
             self.gateway.check(809, "revoked-session")
         self.assertEqual(revoked.exception.status, 409)
+
+    def test_profile_round_trip_and_telegram_username_rejection(self):
+        FakeTelethonRuntime.account_ids["profile-session"] = 901
+
+        profile, _ = self.gateway.profile(901, "profile-session")
+        self.assertEqual(
+            profile,
+            {
+                "first_name": "Ada",
+                "last_name": "Lovelace",
+                "username": "user_901",
+                "about": "",
+            },
+        )
+
+        updated, _ = self.gateway.update_profile(
+            901, "profile-session", "Ада", "", "ada_promo", "Пишу о проекте"
+        )
+        self.assertEqual(
+            updated,
+            {
+                "first_name": "Ада",
+                "last_name": "",
+                "username": "ada_promo",
+                "about": "Пишу о проекте",
+            },
+        )
+        again, _ = self.gateway.profile(901, "profile-session")
+        self.assertEqual(again, updated)
+
+        FakeTelethonRuntime.account_ids["occupied-session"] = 902
+        FakeTelethonRuntime.rpc_errors["occupied-session"] = FakeRPCError(
+            "USERNAME_OCCUPIED"
+        )
+        with self.assertRaises(AccountError) as raised:
+            self.gateway.update_profile(
+                902, "occupied-session", "Ada", "", "taken_name", "bio"
+            )
+        self.assertEqual(raised.exception.status, 400)
+        self.assertIn("already taken", raised.exception.message)
 
 
 if __name__ == "__main__":

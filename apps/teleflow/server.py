@@ -3125,6 +3125,24 @@ class TeleflowRequestHandler(http.server.BaseHTTPRequestHandler):
                     200, {"item": accounts.check_account(int(match.group(1)))}
                 )
                 return
+            match = re.fullmatch(r"/api/accounts/([1-9]\d{0,18})/profile", path)
+            if match:
+                if method == "GET":
+                    self._send_json(
+                        200, {"item": accounts.get_profile(int(match.group(1)))}
+                    )
+                elif method == "PUT":
+                    self._send_json(
+                        200,
+                        {
+                            "item": accounts.save_profile(
+                                int(match.group(1)), self._read_json()
+                            )
+                        },
+                    )
+                else:
+                    raise APIError(405, "Method not allowed")
+                return
             match = re.fullmatch(r"/api/accounts/([1-9]\d{0,18})/forget", path)
             if match:
                 if method != "POST":
