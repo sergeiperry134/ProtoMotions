@@ -55,6 +55,16 @@ Example
 """
 
 
+def positive_int(value):
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a positive integer") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
+
 def create_parser():
     """Create and configure the argument parser for inference."""
     parser = argparse.ArgumentParser(
@@ -86,7 +96,10 @@ def create_parser():
         help="Simulator to use (e.g., 'isaacgym', 'isaaclab', 'newton', 'genesis')",
     )
     parser.add_argument(
-        "--num-envs", type=int, default=1, help="Number of parallel environments to run"
+        "--num-envs",
+        type=positive_int,
+        default=1,
+        help="Number of parallel environments to run",
     )
     parser.add_argument(
         "--motion-file",
@@ -239,12 +252,16 @@ def main():
     args = parser.parse_args()
 
     checkpoint = Path(args.checkpoint)
+    if not checkpoint.is_file():
+        parser.error(f"checkpoint file not found: {checkpoint}")
 
     # Load frozen configs from resolved_configs.pt (exact reproducibility)
     resolved_configs_path = checkpoint.parent / "resolved_configs_inference.pt"
-    assert (
-        resolved_configs_path.exists()
-    ), f"Could not find resolved configs at {resolved_configs_path}"
+    if not resolved_configs_path.is_file():
+        parser.error(
+            f"inference config not found: {resolved_configs_path} "
+            "(required alongside the checkpoint)"
+        )
 
     log.info(f"Loading resolved configs from {resolved_configs_path}")
     resolved_configs = torch.load(
